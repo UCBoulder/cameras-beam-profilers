@@ -33,7 +33,8 @@ default, or any data_*.npy loaded from disk) can be subtracted from the live
 feed; snapshots always save the raw frame.
 
 With "Gaussian fit" on, a rotated 2D Gaussian is fitted to the displayed
-spot FIT_PER_SECOND times a second (gaussian_fit.py, ~10 ms per fit): the
+spot FIT_PER_SECOND times a second (gaussian_fit.py, ~10 ms per fit at any
+window size thanks to binning): the
 centre and 1/e² radii are shown under the image, in pixels or µm on the
 sensor, from the top-left pixel or the camera centre, and the ellipse is
 drawn on the image.
@@ -207,7 +208,7 @@ class LiveView(QtWidgets.QMainWindow):
 
     POLL_MS = 30       # grab_latest() polling period
     STATUS_S = 0.5     # status-bar refresh
-    FIT_PER_SECOND = 2.0
+    FIT_PER_SECOND = 10.0   # at most; a fit slower than the interval just delays the next one
 
     def __init__(self, cam, data_root: str | Path, experiment: str = "live view"):
         super().__init__()
@@ -322,7 +323,7 @@ class LiveView(QtWidgets.QMainWindow):
         self.fit_origin = QtWidgets.QComboBox()
         self.fit_origin.addItems(["top-left pixel", "camera centre"])
         self.fit_window = QtWidgets.QSpinBox()
-        self.fit_window.setRange(5, 200)
+        self.fit_window.setRange(5, 1000)
         self.fit_window.setValue(30)
         self.fit_window.setSuffix(" px")
         self.fit_ellipse = QtWidgets.QCheckBox("Show the 1/e² ellipse")
@@ -597,7 +598,6 @@ class LiveView(QtWidgets.QMainWindow):
         now = time.perf_counter()
         if not self.fit_on.isChecked() or now - self._fit_time < 1.0 / self.FIT_PER_SECOND:
             return
-        self._fit_time = now
         try:
             fit = fit_gaussian_2d(frame, self.fit_window.value())
         except RuntimeError as err:
@@ -605,7 +605,9 @@ class LiveView(QtWidgets.QMainWindow):
         else:
             fit["x0"] += self._aoi["offset_x"]   # array coordinates of the frame -> sensor pixels
             fit["y0"] += self._aoi["offset_y"]
+            fit["ms"] = 1e3 * (time.perf_counter() - now)
             self._fit = fit
+        self._fit_time = time.perf_counter()   # interval counted from the end of the fit
         self._show_fit()
 
     def _show_fit(self):
@@ -623,7 +625,9 @@ class LiveView(QtWidgets.QMainWindow):
         self.fit_readout.setText(
             f"<b>Gaussian centre</b>  x = <b>{x * scale:.2f}</b>, y = <b>{y * scale:.2f}</b> {unit}"
             f"&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;1/e² radii {fit['wx'] * scale:.2f} × {fit['wy'] * scale:.2f} {unit}, "
-            f"axis at {np.degrees(fit['theta']):.0f}°&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;fitted peak {fit['peak']:.0f} counts")
+            f"axis at {np.degrees(fit['theta']):.0f}°&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;fitted peak {fit['peak']:.0f} counts"
+            f"&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;{fit['ms']:.0f} ms"
+            + (f" (binned {fit['binning']}×)" if fit["binning"] > 1 else ""))
         if not self.fit_ellipse.isChecked():
             self.fit_curve.setData([], [])
             return
