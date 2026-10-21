@@ -1,14 +1,39 @@
 # allied-vision-camera
 
-Snapshot-oriented Python wrapper around [`vmbpy`](https://github.com/alliedvision/VmbPy) for Allied Vision cameras (Alvium G1 family), plus PSF plotting helpers.
+Snapshot-oriented Python wrappers for the yb2 lab's cameras, a live viewer, and PSF plotting helpers.
 
 One canonical camera layer for the yb2 lab — pull it into any project as a git submodule instead of copying camera code around.
 
-**Design:** camera configuration is slow and happens once at construction; snapshots are fast and never re-query hardware (all metadata is cached internally).
+**Design:** camera configuration is slow and happens once at construction; snapshots are fast and never re-query hardware (all metadata is cached internally). Every camera has the same `snapshot()` and writes the same folder layout.
+
+## Cameras
+
+| Package | Camera | Driver (install separately) | Docs |
+|---|---|---|---|
+| `cinogy_uc480` | Cinogy CinCam CMOS 1201 beam profiler, with a live mode | Thorlabs uc480 driver (free ThorCam). No RayCi, no pyueye. | [cinogy_uc480/README.md](cinogy_uc480/README.md) |
+| `cinogy` | Cinogy CinCam CMOS 1201 | CINOGY / RayCi install, `pip install -e ".[ueye]"` | [cinogy/README.md](cinogy/README.md) |
+| `allied_vision` | Allied Vision Alvium G1, Mako G-131B | Vimba X SDK | this README |
+| `camera_live_view` | Live viewer for `cinogy_uc480` (pyqtgraph) | – | [examples/README.md](examples/README.md) |
+
+One example script per camera, and the live viewer, are in [examples/](examples/README.md).
+
+### Quick start: CinCam
+
+1. Install **ThorCam** from Thorlabs (brings the uc480 driver).
+2. Clone and install:
+   ```bash
+   git clone git@github.com:UCBoulder/allied-vision-camera.git
+   cd allied-vision-camera
+   pip install -r requirements.txt
+   ```
+3. Close RayCi / ThorCam, then `python examples/live_view.py` or `python examples/snapshot_cincam_uc480.py`.
 
 ---
 
-## Prerequisites
+## Prerequisites (Allied Vision)
+
+The rest of this README covers the Allied Vision cameras. The CinCam needs none of it: see
+[Quick start: CinCam](#quick-start-cincam).
 
 Python ≥ 3.11, and **the Vimba X SDK installed system-wide**.
 
@@ -139,7 +164,7 @@ As a standalone checkout:
 ```bash
 git clone git@github.com:UCBoulder/allied-vision-camera.git
 cd allied-vision-camera
-pip install -e .
+pip install -r requirements.txt     # = pip install -e ".[live]": all cameras + the live viewer
 ```
 
 For use inside another project, see [Using this repo as a submodule](#using-this-repo-as-a-submodule).
@@ -210,7 +235,7 @@ Usable standalone on any 2-D array — no camera required:
 ```python
 from allied_vision import save_psf_2d, save_psf_3d
 
-save_psf_2d(img, "preview.png", title="PSF", max_value=cam.max_value)   # side-by-side fixed full-scale / auto-scaled
+save_psf_2d(img, "preview.png", title="PSF", max_value=cam.max_value)   # beam colours, log scale 0..max_value
 save_psf_3d(img, "preview_3d.png", title="PSF")  # 3-D surface
 ```
 
