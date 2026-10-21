@@ -1,4 +1,4 @@
-# allied-vision-camera
+# cameras-beam-profilers
 
 Snapshot-oriented Python wrappers for the yb2 lab's cameras, a live viewer, and PSF plotting helpers.
 
@@ -22,8 +22,8 @@ One example script per camera, and the live viewer, are in [examples/](examples/
 1. Install **ThorCam** from Thorlabs (brings the uc480 driver).
 2. Clone and install:
    ```bash
-   git clone git@github.com:UCBoulder/allied-vision-camera.git
-   cd allied-vision-camera
+   git clone git@github.com:UCBoulder/cameras-beam-profilers.git
+   cd cameras-beam-profilers
    pip install -r requirements.txt
    ```
 3. Close RayCi / ThorCam, then `python examples/live_view.py` or `python examples/snapshot_cincam_uc480.py`.
@@ -162,8 +162,8 @@ to open while it is running. This is the single most common failure in practice.
 As a standalone checkout:
 
 ```bash
-git clone git@github.com:UCBoulder/allied-vision-camera.git
-cd allied-vision-camera
+git clone git@github.com:UCBoulder/cameras-beam-profilers.git
+cd cameras-beam-profilers
 pip install -r requirements.txt     # = pip install -e ".[live]": all cameras + the live viewer
 ```
 
@@ -250,18 +250,18 @@ of an experiment you ran last month.
 From the root of the consuming repo:
 
 ```bash
-git submodule add git@github.com:UCBoulder/allied-vision-camera.git external/allied_vision_camera
-git commit -m "Add allied-vision-camera submodule"
+git submodule add git@github.com:UCBoulder/cameras-beam-profilers.git external/cameras_beam_profilers
+git commit -m "Add cameras-beam-profilers submodule"
 ```
 
 That creates two tracked things: a `.gitmodules` file recording the URL and path, and a
-special entry at `external/allied_vision_camera` — a *gitlink* storing one commit SHA,
+special entry at `external/cameras_beam_profilers` — a *gitlink* storing one commit SHA,
 not the files. `external/` is a convention; any path works.
 
 Then make the package importable. Preferred:
 
 ```bash
-pip install -e external/allied_vision_camera
+pip install -e external/cameras_beam_profilers
 ```
 
 `from allied_vision import AlviumG1` then works from any working directory. The
@@ -294,13 +294,13 @@ A submodule tracks a **commit, not a branch**, so new work here does not reach a
 project until someone moves the pointer on purpose:
 
 ```bash
-git submodule update --remote external/allied_vision_camera   # fast-forward to origin/main
-git add external/allied_vision_camera
-git commit -m "Bump allied-vision-camera to <short-sha>"
+git submodule update --remote external/cameras_beam_profilers   # fast-forward to origin/main
+git add external/cameras_beam_profilers
+git commit -m "Bump cameras-beam-profilers to <short-sha>"
 ```
 
 The staged change is one line — the old SHA replaced by the new one. Review what you
-are pulling in first with `git -C external/allied_vision_camera log --oneline HEAD..origin/main`.
+are pulling in first with `git -C external/cameras_beam_profilers log --oneline HEAD..origin/main`.
 
 ### Making changes to the camera code from inside a project
 
@@ -309,15 +309,15 @@ starts **detached**, and committing onto a detached HEAD strands the work where 
 checkout will lose it. Always land on a branch first:
 
 ```bash
-cd external/allied_vision_camera
+cd external/cameras_beam_profilers
 git checkout main && git pull        # leave detached HEAD before editing
 # ...edit, test...
 git commit -am "Fix exposure clamping"
 git push origin main                 # push to THIS repo first
 
 cd ../..                             # back to the project
-git add external/allied_vision_camera
-git commit -m "Bump allied-vision-camera"
+git add external/cameras_beam_profilers
+git commit -m "Bump cameras-beam-profilers"
 ```
 
 **Push the submodule before pushing the parent.** If you push only the parent, its
@@ -338,7 +338,7 @@ parent push when the submodule commit is unpublished — worth setting as a habi
 
 ### Gotchas
 
-- A dirty submodule shows in the parent as a bare `modified: external/allied_vision_camera (modified content)` with no file detail. Run `git -C external/allied_vision_camera status` to see what actually changed.
+- A dirty submodule shows in the parent as a bare `modified: external/cameras_beam_profilers (modified content)` with no file detail. Run `git -C external/cameras_beam_profilers status` to see what actually changed.
 - Switching branches in the parent does **not** switch the submodule. After any branch change, run `git submodule update` or you are silently testing against the wrong camera code.
 - `git submodule update` is destructive to uncommitted changes inside the submodule. Commit or stash there first.
 - Never commit an edit to the camera code only in the parent project's copy — it belongs here, or the next `submodule update` erases it.

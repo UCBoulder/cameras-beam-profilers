@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "allied-vision-camera"
+name = "cameras-beam-profilers"
 version = "0.2.0"
 description = "Snapshot-oriented camera wrappers for the yb2 lab: Allied Vision (vmbpy) and Cinogy CinCam (uc480 / uEye), plus a live viewer"
 readme = "README.md"
@@ -25,7 +25,7 @@ ueye = [               # cinogy.CinCamCMOS1201 (CinCam through the CINOGY / RayC
 ]
 
 [project.urls]
-Repository = "https://github.com/UCBoulder/allied-vision-camera"
+Repository = "https://github.com/UCBoulder/cameras-beam-profilers"
 
 [tool.setuptools]
 packages = ["allied_vision", "cinogy", "cinogy_uc480", "camera_live_view"]
