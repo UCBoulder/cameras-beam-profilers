@@ -1,9 +1,8 @@
 """
 Camera visualization helpers for PSF analysis.
 
-save_psf_2d  — side-by-side 2-D plot:
-    Left panel:  Blues, fixed to 0–max_value (cross-image comparison).
-    Right panel: Blues, auto-scaled to [0, img.max()] (reveal fine features).
+save_psf_2d  — 2-D plot: beam-profiler colours on a logarithmic scale fixed
+    to 0–max_value (white = saturated), the same scale as the live view.
 
 save_psf_3d  — 3-D surface plot, Blues fixed to 0–max_value.
 
@@ -39,6 +38,13 @@ def _fixed_scale_ticks(max_value: int) -> list[int]:
 def _cbar_label(max_value: int) -> str:
     return f"Intensity (counts, {int(max_value).bit_length()}-bit)"
 
+# Beam-profiler colours, the same as the live view and PSFPlotter.BEAM_CMAP:
+# dark blue → blue → cyan → green → yellow → red, white at saturation.
+BEAM_CMAP = mcolors.LinearSegmentedColormap.from_list("beam", [
+    (0.0, "#00004d"), (0.15, "#0000ff"), (0.35, "#00ffff"), (0.5, "#00ff00"),
+    (0.65, "#ffff00"), (0.85, "#ff0000"), (1.0, "#ffffff"),
+])
+
 # Default colormap for AlviumG1.plot(): black → blue → green.
 # Dark background keeps faint PSF wings visible; used with a fixed full-scale range.
 PSF_CMAP = mcolors.LinearSegmentedColormap.from_list(
@@ -57,15 +63,9 @@ def save_psf_2d(
     max_value: int = UINT12_MAX,
 ) -> None:
     """
-    Save a compact side-by-side 2-D PSF comparison plot as PNG.
-
-    Left panel:  Blues, fixed to 0–max_value.  All captures share the same scale
-                 so brightness differences across snapshots are visible.
-    Right panel: Blues, auto-scaled to [0, img.max()].  Stretches the
-                 colormap to the peak of *this* image to reveal fine features
-                 that would be invisible on the fixed-range panel.
-
-    Panels share the y-axis; each has a thin vertical colorbar on its right.
+    Save the frame as a PNG: one panel in the beam-profiler colours on a
+    logarithmic scale fixed to 0–max_value (white = saturated). Every
+    snapshot shares the same scale, and faint wings stay visible.
 
     Parameters
     ----------
@@ -74,52 +74,31 @@ def save_psf_2d(
     save_path : Path
         Destination PNG path.
     title : str
-        Optional figure title shown above both panels.
+        Optional title; the peak value (and a saturation warning) is added below it.
     max_value : int
-        Full-scale value for the fixed panel (default 4095, i.e. Mono12).
+        Full-scale value (default 4095, i.e. Mono12).
     """
     img_max = int(img.max())
-    auto_ticks = [int(round(v)) for v in np.linspace(0, img_max, 5)]
-
     h_px, w_px = img.shape
-    aspect = w_px / h_px
-    panel_h = 4.0                          # inches, fixed panel height
-    panel_w = max(aspect * panel_h, 3.0)   # inches, scales with image width
-    fig_w = min(2 * panel_w + 2.0, 22.0)  # +2 for colorbars/labels, cap at 22"
-    fig_h = panel_h + 1.0                  # +1 for title and axis labels
+    panel_h = 5.0                                              # inches
+    fig_w = min(max(w_px / h_px * panel_h, 3.0) + 1.5, 16.0)  # + colorbar, capped
 
-    fig, (ax_fixed, ax_auto) = plt.subplots(
-        1, 2, figsize=(fig_w, fig_h), sharey=True,
-        constrained_layout=True,
-    )
-
-    # --- Left: fixed range (0–max_value) ---
-    im_fixed = ax_fixed.imshow(
-        img, cmap="Blues", vmin=0, vmax=max_value,
+    fig, ax = plt.subplots(figsize=(fig_w, panel_h + 0.8), constrained_layout=True)
+    im = ax.imshow(
+        img, cmap=BEAM_CMAP, norm=mcolors.FuncNorm((np.log1p, np.expm1), vmin=0, vmax=max_value),
         origin="upper", interpolation="nearest",
     )
-    cbar_fixed = fig.colorbar(im_fixed, ax=ax_fixed, fraction=0.035, pad=0.03)
-    cbar_fixed.set_ticks(_fixed_scale_ticks(max_value))
-    cbar_fixed.ax.tick_params(labelsize=7)
-    ax_fixed.set_xlabel("x (pixels)", fontsize=8)
-    ax_fixed.set_ylabel("y (pixels)", fontsize=8)
-    ax_fixed.tick_params(labelsize=7)
-    ax_fixed.set_title(f"Fixed  (0 – {max_value})", fontsize=9)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.04, pad=0.03)
+    cbar.set_ticks([t for t in (0, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000) if t < max_value]
+                   + [max_value])
+    cbar.set_label(_cbar_label(max_value) + ", log scale", fontsize=8)
+    cbar.ax.tick_params(labelsize=7)
+    ax.set_xlabel("x (pixels)", fontsize=8)
+    ax.set_ylabel("y (pixels)", fontsize=8)
+    ax.tick_params(labelsize=7)
 
-    # --- Right: auto-scaled to peak of this image ---
-    im_auto = ax_auto.imshow(
-        img, cmap="Blues", vmin=0, vmax=img_max,
-        origin="upper", interpolation="nearest",
-    )
-    cbar_auto = fig.colorbar(im_auto, ax=ax_auto, fraction=0.035, pad=0.03)
-    cbar_auto.set_ticks(auto_ticks)
-    cbar_auto.ax.tick_params(labelsize=7)
-    ax_auto.set_xlabel("x (pixels)", fontsize=8)
-    ax_auto.tick_params(labelsize=7)
-    ax_auto.set_title(f"Auto-scaled  (0 – {img_max})", fontsize=9)
-
-    if title:
-        fig.suptitle(title, fontsize=9)
+    peak = f"peak {img_max} / {max_value}" + ("   SATURATED" if img_max >= 0.99 * max_value else "")
+    ax.set_title(f"{title}\n{peak}" if title else peak, fontsize=9)
 
     fig.savefig(str(save_path), dpi=150, bbox_inches="tight")
     plt.close(fig)
