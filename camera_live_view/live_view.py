@@ -32,6 +32,12 @@ A recorded background (one snapshot, saved under data/background/ by
 default, or any data_*.npy loaded from disk) can be subtracted from the live
 feed; snapshots always save the raw frame.
 
+With "Gaussian fit" on, a rotated 2D Gaussian is fitted to the displayed
+spot FIT_PER_SECOND times a second (gaussian_fit.py, ~10 ms per fit): the
+centre and 1/e² radii are shown under the image, in pixels or µm on the
+sensor, from the top-left pixel or the camera centre, and the ellipse is
+drawn on the image.
+
 Layout after Allied Vision's viewer: toolbar on top (live on/off, save),
 controls in a dock on the left, image in the middle. Mouse wheel zooms,
 right-drag (or left-drag outside the rectangle) pans; the yellow rectangle is
@@ -47,6 +53,8 @@ from pathlib import Path
 import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
+
+from .gaussian_fit import fit_gaussian_2d
 
 # Beam-profiler colour scale, the same as PSFPlotter.BEAM_CMAP: dark blue ->
 # blue -> cyan -> green -> yellow -> red, white only at saturation
@@ -199,6 +207,7 @@ class LiveView(QtWidgets.QMainWindow):
 
     POLL_MS = 30       # grab_latest() polling period
     STATUS_S = 0.5     # status-bar refresh
+    FIT_PER_SECOND = 2.0
 
     def __init__(self, cam, data_root: str | Path, experiment: str = "live view"):
         super().__init__()
@@ -302,6 +311,32 @@ class LiveView(QtWidgets.QMainWindow):
         self.bg_warning.setStyleSheet("color: red")
         self.bg_warning.hide()
 
+        # Gaussian fit: on / off, units and origin of the readout, window around the spot
+        self.fit_on = QtWidgets.QCheckBox(f"Fit a 2D Gaussian to the spot ({self.FIT_PER_SECOND:g} / s)")
+        self.fit_on.toggled.connect(self._show_fit)
+        self.fit_units = QtWidgets.QComboBox()
+        self.fit_units.addItem("pixels", 1.0)
+        pixel_um = getattr(self.cam, "pixel_size_um", None)
+        if pixel_um:
+            self.fit_units.addItem("µm on the sensor", float(pixel_um))
+        self.fit_origin = QtWidgets.QComboBox()
+        self.fit_origin.addItems(["top-left pixel", "camera centre"])
+        self.fit_window = QtWidgets.QSpinBox()
+        self.fit_window.setRange(5, 200)
+        self.fit_window.setValue(30)
+        self.fit_window.setSuffix(" px")
+        self.fit_ellipse = QtWidgets.QCheckBox("Show the 1/e² ellipse")
+        self.fit_ellipse.setChecked(True)
+        for w in (self.fit_units, self.fit_origin):
+            w.currentIndexChanged.connect(self._show_fit)
+        self.fit_ellipse.toggled.connect(self._show_fit)
+        fit_form = QtWidgets.QFormLayout()
+        fit_form.addRow("Units", self.fit_units)
+        fit_form.addRow("(0, 0) at", self.fit_origin)
+        fit_form.addRow("Fit window ±", self.fit_window)
+        fit_widget = QtWidgets.QWidget()
+        fit_widget.setLayout(fit_form)
+
         self.log_scale = QtWidgets.QCheckBox("Logarithmic colour scale")
         self.log_scale.setChecked(True)
         self.log_scale.toggled.connect(self._set_colour_scale)
@@ -312,6 +347,7 @@ class LiveView(QtWidgets.QMainWindow):
         layout.addWidget(self._group("Gain", self.gain))
         layout.addWidget(self._group("Region of interest (camera readout)", roi_widget, apply, full, self.show_roi))
         layout.addWidget(self._group("Background", self.bg_label, record, load, self.subtract, self.bg_warning))
+        layout.addWidget(self._group("Gaussian fit", self.fit_on, fit_widget, self.fit_ellipse))
         layout.addWidget(self._group("Display", self.log_scale))
         layout.addStretch(1)
         scroll = QtWidgets.QScrollArea()   # the panel outgrows a small laptop screen
@@ -350,8 +386,14 @@ class LiveView(QtWidgets.QMainWindow):
         self._set_roi(**self._aoi)
         self.plot.autoRange()
 
-        # Row under the plot: pixel under the mouse and its value
+        # Rows under the plot: pixel under the mouse and its value; the Gaussian fit
         self.readout = self.view.addLabel("", row=1, col=0, colspan=2, justify="left")
+        self.fit_readout = self.view.addLabel("", row=2, col=0, colspan=2, justify="left", size="12pt")
+        self.fit_curve = pg.PlotDataItem(pen=pg.mkPen("c", width=2), connect="finite")
+        self.fit_curve.setZValue(11)
+        self.plot.addItem(self.fit_curve)
+        self._fit = None          # last fit, in sensor pixel coordinates
+        self._fit_time = 0.0
         self._mouse_pos = None
         self.plot.scene().sigMouseMoved.connect(self._mouse_moved)
 
@@ -543,9 +585,57 @@ class LiveView(QtWidgets.QMainWindow):
         self._last = frame
         self._frames += 1
         self._update_readout()  # the value under a resting mouse follows the live frame
+        self._update_fit(frame)
         now = time.perf_counter()
         if now - self._t_status >= self.STATUS_S:
             self._update_status(now)
+
+    # ---------- Gaussian fit ----------
+
+    def _update_fit(self, frame: np.ndarray):
+        """Fit the displayed frame every 1 / FIT_PER_SECOND s while the fit is on."""
+        now = time.perf_counter()
+        if not self.fit_on.isChecked() or now - self._fit_time < 1.0 / self.FIT_PER_SECOND:
+            return
+        self._fit_time = now
+        try:
+            fit = fit_gaussian_2d(frame, self.fit_window.value())
+        except RuntimeError as err:
+            self._fit = dict(error=str(err))
+        else:
+            fit["x0"] += self._aoi["offset_x"]   # array coordinates of the frame -> sensor pixels
+            fit["y0"] += self._aoi["offset_y"]
+            self._fit = fit
+        self._show_fit()
+
+    def _show_fit(self):
+        """Readout row and ellipse for the last fit, in the chosen units and origin."""
+        fit = self._fit if self.fit_on.isChecked() else None
+        if fit is None or "error" in fit:
+            self.fit_readout.setText("" if fit is None else f"Gaussian fit: {fit['error']}")
+            self.fit_curve.setData([], [])
+            return
+        scale, unit = self.fit_units.currentData(), "px" if self.fit_units.currentIndex() == 0 else "µm"
+        x, y = fit["x0"], fit["y0"]
+        if self.fit_origin.currentIndex() == 1:       # (0, 0) at the centre of the sensor
+            x -= (self.cam.sensor_width - 1) / 2
+            y -= (self.cam.sensor_height - 1) / 2
+        self.fit_readout.setText(
+            f"<b>Gaussian centre</b>  x = <b>{x * scale:.2f}</b>, y = <b>{y * scale:.2f}</b> {unit}"
+            f"&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;1/e² radii {fit['wx'] * scale:.2f} × {fit['wy'] * scale:.2f} {unit}, "
+            f"axis at {np.degrees(fit['theta']):.0f}°&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;fitted peak {fit['peak']:.0f} counts")
+        if not self.fit_ellipse.isChecked():
+            self.fit_curve.setData([], [])
+            return
+        # ellipse and centre cross in plot coordinates (pixel i spans [i, i + 1), so its centre is i + 0.5)
+        cx, cy = fit["x0"] + 0.5, fit["y0"] + 0.5
+        t = np.linspace(0, 2 * np.pi, 73)
+        ex, ey = fit["wx"] * np.cos(t), fit["wy"] * np.sin(t)
+        c, s_ = np.cos(fit["theta"]), np.sin(fit["theta"])
+        arm = 1.5
+        xs = np.concatenate([cx + ex * c - ey * s_, [np.nan, cx - arm, cx + arm, np.nan, cx, cx]])
+        ys = np.concatenate([cy + ex * s_ + ey * c, [np.nan, cy, cy, np.nan, cy - arm, cy + arm]])
+        self.fit_curve.setData(xs, ys)
 
     def _update_status(self, now: float):
         fps = self._frames / (now - self._t_status)
