@@ -40,7 +40,7 @@ PATH); otherwise set `CINCAM_UC480_DLL` to the full path of `uc480_64.dll`.
   subtraction is shown, and records the background file in the metadata.
 - Live view "Gaussian fit": fits a 2D Gaussian to the spot up to ten times a second and
   shows its centre and 1/e² radii under the image (pixels or µm on the sensor; origin at
-  the top-left pixel or the camera centre) and the ellipse on the image. Useful for
+  the top-left pixel or the camera centre) and the ellipse with its principal axes on the image. Useful for
   alignment: watch the centre while you turn a mirror. The fit window can cover the whole
   sensor (±1000 px): large windows are binned so that a fit stays at 10–20 ms, and a
   small spot inside a large window is automatically refitted unbinned. Set the window

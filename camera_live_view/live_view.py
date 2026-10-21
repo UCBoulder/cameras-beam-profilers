@@ -631,14 +631,15 @@ class LiveView(QtWidgets.QMainWindow):
         if not self.fit_ellipse.isChecked():
             self.fit_curve.setData([], [])
             return
-        # ellipse and centre cross in plot coordinates (pixel i spans [i, i + 1), so its centre is i + 0.5)
+        # ellipse and its principal axes (each as long as its 1/e² radius) in plot coordinates
+        # (pixel i spans [i, i + 1), so its centre is i + 0.5)
         cx, cy = fit["x0"] + 0.5, fit["y0"] + 0.5
         t = np.linspace(0, 2 * np.pi, 73)
         ex, ey = fit["wx"] * np.cos(t), fit["wy"] * np.sin(t)
         c, s_ = np.cos(fit["theta"]), np.sin(fit["theta"])
-        arm = 1.5
-        xs = np.concatenate([cx + ex * c - ey * s_, [np.nan, cx - arm, cx + arm, np.nan, cx, cx]])
-        ys = np.concatenate([cy + ex * s_ + ey * c, [np.nan, cy, cy, np.nan, cy - arm, cy + arm]])
+        wx, wy = fit["wx"], fit["wy"]
+        xs = np.concatenate([cx + ex * c - ey * s_, [np.nan, cx - wx * c, cx + wx * c, np.nan, cx + wy * s_, cx - wy * s_]])
+        ys = np.concatenate([cy + ex * s_ + ey * c, [np.nan, cy - wx * s_, cy + wx * s_, np.nan, cy - wy * c, cy + wy * c]])
         self.fit_curve.setData(xs, ys)
 
     def _update_status(self, now: float):
