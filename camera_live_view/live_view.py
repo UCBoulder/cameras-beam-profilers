@@ -406,7 +406,7 @@ class LiveView(QtWidgets.QMainWindow):
         # Rows under the plot: pixel under the mouse and its value; the Gaussian fit
         self.readout = self.view.addLabel("", row=1, col=0, colspan=2, justify="left")
         self.fit_readout = self.view.addLabel("", row=2, col=0, colspan=2, justify="left", size="12pt")
-        self.fit_curve = pg.PlotDataItem(pen=pg.mkPen("c", width=2), connect="finite")
+        self.fit_curve = pg.PlotDataItem(pen=pg.mkPen("w", width=2), connect="finite")
         self.fit_curve.setZValue(11)
         self.plot.addItem(self.fit_curve)
         self._fit = None          # last fit, in sensor pixel coordinates
