@@ -208,6 +208,7 @@ class SnapshotDialog(QtWidgets.QDialog):
 class LiveView(QtWidgets.QMainWindow):
 
     POLL_MS = 30       # grab_latest() polling period
+    PANEL_MIN_WIDTH = 270   # settings column (px); drag the separator to widen it
     STATUS_S = 0.5     # status-bar refresh
     FIT_PER_SECOND = 10.0   # at most; a fit slower than the interval just delays the next one
     DEAD_PIXEL_FRAMES = 8   # frames averaged by "Find dead pixels"
@@ -260,6 +261,7 @@ class LiveView(QtWidgets.QMainWindow):
         self.act_save.triggered.connect(self.save_snapshot)
         bar.addAction(self.act_live)
         bar.addAction(self.act_save)
+        self.toolbar = bar
 
     @staticmethod
     def _group(title: str, *widgets) -> QtWidgets.QGroupBox:
@@ -318,7 +320,7 @@ class LiveView(QtWidgets.QMainWindow):
         self.bg_warning.hide()
 
         # Gaussian fit: on / off, units and origin of the readout, window around the spot
-        self.fit_on = QtWidgets.QCheckBox(f"Fit a 2D Gaussian to the spot ({self.FIT_PER_SECOND:g} / s)")
+        self.fit_on = QtWidgets.QCheckBox(f"Fit a 2D Gaussian ({self.FIT_PER_SECOND:g} / s)")
         self.fit_on.toggled.connect(self._show_fit)
         self.fit_units = QtWidgets.QComboBox()
         self.fit_units.addItem("pixels", 1.0)
@@ -331,7 +333,7 @@ class LiveView(QtWidgets.QMainWindow):
         self.fit_window.setRange(5, 1000)
         self.fit_window.setValue(30)
         self.fit_window.setSuffix(" px")
-        self.fit_ellipse = QtWidgets.QCheckBox("Show the 1/e² ellipse")
+        self.fit_ellipse = QtWidgets.QCheckBox("Show 1/e² ellipse and axes")
         self.fit_ellipse.setChecked(True)
         for w in (self.fit_units, self.fit_origin):
             w.currentIndexChanged.connect(self._show_fit)
@@ -347,10 +349,13 @@ class LiveView(QtWidgets.QMainWindow):
         self.dead_label = QtWidgets.QLabel()
         self.dead_label.setStyleSheet("color: gray")
         self.dead_label.setWordWrap(True)
-        find_dead = QtWidgets.QPushButton("Find dead pixels (lit sensor, full readout)")
+        find_dead = QtWidgets.QPushButton("Find dead pixels…")
+        find_dead.setToolTip("Light the whole sensor with a broad beam and read out the full sensor first.\n"
+                             "Averages 8 frames, maps dead pixels and dark spots (dust), saves the map.")
         find_dead.clicked.connect(lambda: self.find_dead_pixels())
-        self.dead_ignore = QtWidgets.QCheckBox("Ignore dead pixels and dark spots in fits")
-        self.dead_show = QtWidgets.QCheckBox("Show dead pixels (circles) and dark spots (dots)")
+        self.dead_ignore = QtWidgets.QCheckBox("Ignore them in fits")
+        self.dead_show = QtWidgets.QCheckBox("Show them on the image")
+        self.dead_show.setToolTip("Circles: dead pixels; dots: dark-spot pixels")
         self.dead_show.toggled.connect(self._show_dead)
 
         self.log_scale = QtWidgets.QCheckBox("Logarithmic colour scale")
@@ -361,27 +366,63 @@ class LiveView(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout(panel)
         layout.addWidget(self._group("Exposure", self.exposure))
         layout.addWidget(self._group("Gain", self.gain))
-        layout.addWidget(self._group("Region of interest (camera readout)", roi_widget, apply, full, self.show_roi))
+        layout.addWidget(self._group("Readout region (camera)", roi_widget, apply, full, self.show_roi))
         layout.addWidget(self._group("Background", self.bg_label, record, load, self.subtract, self.bg_warning))
         layout.addWidget(self._group("Gaussian fit", self.fit_on, fit_widget, self.fit_ellipse,
                                      self.dead_label, find_dead, self.dead_ignore, self.dead_show))
         layout.addWidget(self._group("Display", self.log_scale))
         layout.addStretch(1)
-        scroll = QtWidgets.QScrollArea()   # the panel outgrows a small laptop screen
+        # The settings live in a dock: scrollable (never taller than the screen), draggable to the
+        # other side, and floatable into a window of its own (drag its title bar out, or double-click it).
+        scroll = QtWidgets.QScrollArea()
         scroll.setWidget(panel)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setMinimumWidth(panel.sizeHint().width() + 20)
-        dock = QtWidgets.QDockWidget("Camera", self)
-        dock.setWidget(scroll)
-        dock.setFeatures(QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetMovable)
-        self.addDockWidget(QtCore.Qt.DockWidgetArea.LeftDockWidgetArea, dock)
+        scroll.setMinimumWidth(self.PANEL_MIN_WIDTH)
+        self.dock = QtWidgets.QDockWidget("Settings", self)
+        self.dock.setObjectName("settings")           # needed to save / restore the layout
+        self.dock.setWidget(scroll)
+        self.dock.setFeatures(QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetMovable
+                              | QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetFloatable
+                              | QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetClosable)
+        self.dock.setAllowedAreas(QtCore.Qt.DockWidgetArea.LeftDockWidgetArea
+                                  | QtCore.Qt.DockWidgetArea.RightDockWidgetArea)
+        self.addDockWidget(QtCore.Qt.DockWidgetArea.LeftDockWidgetArea, self.dock)
+        self.resizeDocks([self.dock], [self.PANEL_MIN_WIDTH], QtCore.Qt.Orientation.Horizontal)
+
+        # toolbar: show / hide the settings, put the layout back
+        self.toolbar.addSeparator()
+        self.act_settings = self.dock.toggleViewAction()
+        self.act_settings.setText("Settings")
+        self.act_settings.setToolTip("Show / hide the settings column (drag its title bar out for a separate window)")
+        self.toolbar.addAction(self.act_settings)
+        act_reset = QtGui.QAction("Reset layout", self)
+        act_reset.setToolTip("Settings docked on the left, window maximised")
+        act_reset.triggered.connect(self.reset_layout)
+        self.toolbar.addAction(act_reset)
 
     def _build_image(self):
         W, H = self.cam.sensor_width, self.cam.sensor_height
         self.view = pg.GraphicsLayoutWidget()
-        self.setCentralWidget(self.view)
+        centre = QtWidgets.QWidget()
+        column = QtWidgets.QVBoxLayout(centre)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(2)
+        column.addWidget(self.view, 1)
+        # Rows under the plot: pixel under the mouse and its value; the Gaussian fit.
+        # Plain labels that wrap, so a long readout never makes the window wider than the screen.
+        self.readout, self.fit_readout = QtWidgets.QLabel(""), QtWidgets.QLabel("")
+        for label, size in ((self.readout, 10), (self.fit_readout, 12)):
+            label.setWordWrap(True)
+            label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+            label.setContentsMargins(8, 0, 8, 2)
+            label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Minimum)
+            font = label.font()
+            font.setPointSize(size)
+            label.setFont(font)
+            column.addWidget(label)
+        self.setCentralWidget(centre)
         self.plot = self.view.addPlot(viewBox=_PanViewBox())
         self.plot.setAspectLocked(True)
         self.plot.invertY(True)                       # row 0 at the top, like the sensor
@@ -403,9 +444,6 @@ class LiveView(QtWidgets.QMainWindow):
         self._set_roi(**self._aoi)
         self.plot.autoRange()
 
-        # Rows under the plot: pixel under the mouse and its value; the Gaussian fit
-        self.readout = self.view.addLabel("", row=1, col=0, colspan=2, justify="left")
-        self.fit_readout = self.view.addLabel("", row=2, col=0, colspan=2, justify="left", size="12pt")
         self.fit_curve = pg.PlotDataItem(pen=pg.mkPen("w", width=2), connect="finite")
         self.fit_curve.setZValue(11)
         self.plot.addItem(self.fit_curve)
@@ -683,7 +721,7 @@ class LiveView(QtWidgets.QMainWindow):
         text = when if found is None else (
             f"{len(found['ys'])} dead pixels, {len(found['spots'])} dark spots "
             f"({sum(s['n_pixels'] for s in found['spots'])} px), {when}")
-        self.dead_label.setText(f"{text}<br><span style='font-size: 8pt'>{self._dead_path}</span>")
+        self.dead_label.setText(f"{text}<br><span style='font-size: 8pt'>{self._dead_path.name}</span>")
         self.dead_label.setToolTip(str(self._dead_path))
         for w in (self.dead_ignore, self.dead_show):
             w.setEnabled(have)
@@ -777,7 +815,33 @@ class LiveView(QtWidgets.QMainWindow):
         warning = "   —   SATURATED, lower the exposure" if peak >= 0.99 * self.cam.max_value else ""
         self.statusBar().showMessage(f"Saved {out_dir}   (peak {peak} / {self.cam.max_value}){warning}", 15000)
 
+    # ---------- window layout ----------
+
+    _settings = ("cameras-beam-profilers", "live_view")
+
+    def show_remembered(self):
+        """Show the window as it was closed last time (size, position, settings dock); maximised the first time."""
+        store = QtCore.QSettings(*self._settings)
+        geometry, state = store.value("geometry"), store.value("state")
+        if geometry is not None and self.restoreGeometry(geometry):
+            if state is not None:
+                self.restoreState(state)
+            self.show()
+        else:
+            self.showMaximized()   # fills the screen minus the taskbar, so nothing is hidden behind it
+
+    def reset_layout(self):
+        self.dock.setFloating(False)
+        self.addDockWidget(QtCore.Qt.DockWidgetArea.LeftDockWidgetArea, self.dock)
+        self.dock.show()
+        self.resizeDocks([self.dock], [self.PANEL_MIN_WIDTH], QtCore.Qt.Orientation.Horizontal)
+        self.showNormal()
+        self.showMaximized()
+
     def closeEvent(self, event):
+        store = QtCore.QSettings(*self._settings)
+        store.setValue("geometry", self.saveGeometry())
+        store.setValue("state", self.saveState())
         self.set_live(False)
         super().closeEvent(event)
 
@@ -786,7 +850,7 @@ def run_live_view(cam, data_root: str | Path, experiment: str = "live view") -> 
     """Open the viewer on `cam` and block until the window is closed."""
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     window = LiveView(cam, data_root, experiment)
-    window.showMaximized()  # fills the screen minus the taskbar, so nothing is hidden behind it
+    window.show_remembered()
     try:
         return app.exec()
     finally:

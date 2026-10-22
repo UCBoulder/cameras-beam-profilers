@@ -35,6 +35,12 @@ PATH); otherwise set `CINCAM_UC480_DLL` to the full path of `uc480_64.dll`.
   ignored by git.
 - `aoi` in `CONFIG` reads out only a rectangle of the sensor (faster, smaller files); the
   rectangle is recorded in the metadata.
+- Live view layout: the settings column is a dock. Drag the separator to widen it, drag
+  its title bar out (or double-click it) to make it a window of its own, drop it on the
+  right, or hide it with the "Settings" toolbar button to give the image the whole
+  screen. It scrolls when taller than the screen. The window remembers its size, position
+  and dock layout between runs; "Reset layout" puts everything back (dock on the left,
+  window maximised).
 - Live view mouse: wheel zooms, right-drag pans, left-drag moves or resizes the yellow
   readout rectangle. The save button stores the raw frame even when background
   subtraction is shown, and records the background file in the metadata.
