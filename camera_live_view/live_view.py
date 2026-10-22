@@ -35,7 +35,7 @@ feed; snapshots always save the raw frame.
 With "Gaussian fit" on, a rotated 2D Gaussian is fitted to the displayed
 spot FIT_PER_SECOND times a second (gaussian_fit.py, ~10 ms per fit at any
 window size thanks to binning): the
-centre and 1/e² radii are shown under the image, in pixels or µm on the
+centre, 1/e² radii, ellipticity (minor / major) and major-axis angle are shown under the image, in pixels or µm on the
 sensor, from the top-left pixel or the camera centre, and the ellipse is
 drawn on the image.
 
@@ -686,10 +686,15 @@ class LiveView(QtWidgets.QMainWindow):
         if self.fit_origin.currentIndex() == 1:       # (0, 0) at the centre of the sensor
             x -= (self.cam.sensor_width - 1) / 2
             y -= (self.cam.sensor_height - 1) / 2
+        # ellipticity as in ISO 11146: minor / major radius (1 = round); angle of the major axis from +x
+        w_major, w_minor = max(fit["wx"], fit["wy"]), min(fit["wx"], fit["wy"])
+        major_deg = np.degrees(fit["theta"]) + (90 if fit["wy"] > fit["wx"] else 0)
+        major_deg = (major_deg + 90) % 180 - 90
         self.fit_readout.setText(
             f"<b>Gaussian centre</b>  x = <b>{x * scale:.2f}</b>, y = <b>{y * scale:.2f}</b> {unit}"
-            f"&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;1/e² radii {fit['wx'] * scale:.2f} × {fit['wy'] * scale:.2f} {unit}, "
-            f"axis at {np.degrees(fit['theta']):.0f}°&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;fitted peak {fit['peak']:.0f} counts"
+            f"&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;1/e² radii {w_major * scale:.2f} × {w_minor * scale:.2f} {unit}, "
+            f"<b>ellipticity {w_minor / w_major:.3f}</b>, major axis at {major_deg:.0f}°"
+            f"&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;fitted peak {fit['peak']:.0f} counts"
             f"&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;{fit['ms']:.0f} ms"
             + (f" (binned {fit['binning']}×)" if fit["binning"] > 1 else ""))
         if not self.fit_ellipse.isChecked():
