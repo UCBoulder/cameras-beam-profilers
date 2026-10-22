@@ -26,7 +26,10 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime
 
-from . import _uc480_api as api
+try:
+    from . import _uc480_api as api
+except ImportError:              # the file is run directly (python cincam_uc480.py, or the IDE's run button)
+    import _uc480_api as api
 
 
 class CinCamUC480:
@@ -842,3 +845,15 @@ class CinCamUC480:
         print(f"[CinCam uc480] Snapshot saved to {base_dir}")
 
         return img, base_dir
+
+
+if __name__ == "__main__":
+    # Quick check that the camera answers: connect, grab one frame, report, close.
+    # Real use goes through the examples (examples/live_view.py, examples/snapshot_cincam_uc480.py).
+    cam = CinCamUC480({"data_root": Path.cwd() / "data"})
+    try:
+        img = cam.capture_frame()
+        print(f"Frame {img.shape[1]} x {img.shape[0]}, peak {int(img.max())} / {cam.max_value}, "
+              f"exposure {cam.exposure_us:.0f} us, gain {cam.gain_db:g} dB")
+    finally:
+        cam.close()
