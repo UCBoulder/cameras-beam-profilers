@@ -89,3 +89,11 @@ cam.stop_live()
   `pixel_clock_mhz` for longer exposures. The exposure actually set (rounded to the
   line time, 66.75 us) is what goes into the metadata.
 - `gain_db` maps to the uEye master gain factor (100 = 1x).
+
+## Dead pixels
+
+`dead_pixels_<serial>.json` in this folder is the camera's dead-pixel map, written by
+the live viewer ("Find dead pixels", see `examples/README.md`) and read by it at start;
+`cam.dead_pixel_file` gives the path and every snapshot's metadata records it under
+`dead_pixel_file`. Frames are never altered: the map is for analysis code
+(`camera_live_view.dead_pixels.load_dead_pixels` / `repair`).

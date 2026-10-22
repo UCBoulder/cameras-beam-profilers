@@ -56,6 +56,7 @@ import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from .gaussian_fit import fit_gaussian_2d
+from .dead_pixels import find_dead_pixels, load_dead_pixels, repair, save_dead_pixels
 
 # Beam-profiler colour scale, the same as PSFPlotter.BEAM_CMAP: dark blue ->
 # blue -> cyan -> green -> yellow -> red, white only at saturation
@@ -209,6 +210,7 @@ class LiveView(QtWidgets.QMainWindow):
     POLL_MS = 30       # grab_latest() polling period
     STATUS_S = 0.5     # status-bar refresh
     FIT_PER_SECOND = 10.0   # at most; a fit slower than the interval just delays the next one
+    DEAD_PIXEL_FRAMES = 8   # frames averaged by "Find dead pixels"
 
     def __init__(self, cam, data_root: str | Path, experiment: str = "live view"):
         super().__init__()
@@ -227,6 +229,9 @@ class LiveView(QtWidgets.QMainWindow):
         self._background_settings = None   # (exposure_us, gain_db) the background was taken with
         self._bg_slice = None       # part of the background covering the current readout
         self._frames, self._t_status = 0, time.perf_counter()
+        self._dead = (np.array([], int), np.array([], int))   # (ys, xs) in sensor pixels
+        self._dead_path = Path(getattr(cam, "dead_pixel_file", self.data_root / "dead_pixels.json"))
+        self._dead_accum = None     # raw frames being averaged for "Find dead pixels"
 
         self._build_toolbar()
         self._build_controls()
@@ -338,6 +343,16 @@ class LiveView(QtWidgets.QMainWindow):
         fit_widget = QtWidgets.QWidget()
         fit_widget.setLayout(fit_form)
 
+        # dead pixels: found on demand from the lit sensor, kept in a JSON file, ignored in fits
+        self.dead_label = QtWidgets.QLabel()
+        self.dead_label.setStyleSheet("color: gray")
+        self.dead_label.setWordWrap(True)
+        find_dead = QtWidgets.QPushButton("Find dead pixels (lit sensor, full readout)")
+        find_dead.clicked.connect(lambda: self.find_dead_pixels())
+        self.dead_ignore = QtWidgets.QCheckBox("Ignore dead pixels in fits")
+        self.dead_show = QtWidgets.QCheckBox("Show dead pixels")
+        self.dead_show.toggled.connect(self._show_dead)
+
         self.log_scale = QtWidgets.QCheckBox("Logarithmic colour scale")
         self.log_scale.setChecked(True)
         self.log_scale.toggled.connect(self._set_colour_scale)
@@ -348,7 +363,8 @@ class LiveView(QtWidgets.QMainWindow):
         layout.addWidget(self._group("Gain", self.gain))
         layout.addWidget(self._group("Region of interest (camera readout)", roi_widget, apply, full, self.show_roi))
         layout.addWidget(self._group("Background", self.bg_label, record, load, self.subtract, self.bg_warning))
-        layout.addWidget(self._group("Gaussian fit", self.fit_on, fit_widget, self.fit_ellipse))
+        layout.addWidget(self._group("Gaussian fit", self.fit_on, fit_widget, self.fit_ellipse,
+                                     self.dead_label, find_dead, self.dead_ignore, self.dead_show))
         layout.addWidget(self._group("Display", self.log_scale))
         layout.addStretch(1)
         scroll = QtWidgets.QScrollArea()   # the panel outgrows a small laptop screen
@@ -395,6 +411,10 @@ class LiveView(QtWidgets.QMainWindow):
         self.plot.addItem(self.fit_curve)
         self._fit = None          # last fit, in sensor pixel coordinates
         self._fit_time = 0.0
+        self.dead_marks = pg.ScatterPlotItem(pen=pg.mkPen("r", width=1.5), brush=None, symbol="o", size=12)
+        self.dead_marks.setZValue(12)
+        self.plot.addItem(self.dead_marks)
+        self._load_dead_pixels()
         self._mouse_pos = None
         self.plot.scene().sigMouseMoved.connect(self._mouse_moved)
 
@@ -577,6 +597,8 @@ class LiveView(QtWidgets.QMainWindow):
         frame = self.cam.grab_latest()
         if frame is None:
             return
+        if self._dead_accum is not None:
+            self._accumulate_dead(frame)
         if self.subtract.isChecked() and self._bg_slice is not None and self._bg_slice.shape == frame.shape:
             frame = np.clip(frame.astype(np.int32) - self._bg_slice, 0, None).astype(np.uint16)
         self.img_item.setImage(frame, autoLevels=False)
@@ -598,6 +620,9 @@ class LiveView(QtWidgets.QMainWindow):
         now = time.perf_counter()
         if not self.fit_on.isChecked() or now - self._fit_time < 1.0 / self.FIT_PER_SECOND:
             return
+        if self.dead_ignore.isChecked() and len(self._dead[0]):
+            ys, xs = self._dead
+            frame = repair(frame, ys - self._aoi["offset_y"], xs - self._aoi["offset_x"])
         try:
             fit = fit_gaussian_2d(frame, self.fit_window.value())
         except RuntimeError as err:
@@ -641,6 +666,69 @@ class LiveView(QtWidgets.QMainWindow):
         xs = np.concatenate([cx + ex * c - ey * s_, [np.nan, cx - wx * c, cx + wx * c, np.nan, cx + wy * s_, cx - wy * s_]])
         ys = np.concatenate([cy + ex * s_ + ey * c, [np.nan, cy - wx * s_, cy + wx * s_, np.nan, cy - wy * c, cy + wy * c]])
         self.fit_curve.setData(xs, ys)
+
+    # ---------- dead pixels ----------
+
+    def _load_dead_pixels(self):
+        if self._dead_path.exists():
+            ys, xs, info = load_dead_pixels(self._dead_path)
+            self._set_dead_pixels(ys, xs, f"{len(ys)} dead pixels, found {info.get('found', '?')[:16]}")
+        else:
+            self._set_dead_pixels(np.array([], int), np.array([], int), "no dead-pixel map yet")
+
+    def _set_dead_pixels(self, ys, xs, text: str):
+        self._dead = (np.asarray(ys, int), np.asarray(xs, int))
+        have = len(ys) > 0
+        self.dead_label.setText(f"{text}<br><span style='font-size: 8pt'>{self._dead_path}</span>")
+        self.dead_label.setToolTip(str(self._dead_path))
+        for w in (self.dead_ignore, self.dead_show):
+            w.setEnabled(have)
+        self.dead_ignore.setChecked(have)
+        self._show_dead()
+
+    def _show_dead(self):
+        ys, xs = self._dead
+        if self.dead_show.isChecked() and len(ys):
+            self.dead_marks.setData(xs + 0.5, ys + 0.5)   # pixel i spans [i, i + 1)
+        else:
+            self.dead_marks.setData([], [])
+
+    def find_dead_pixels(self):
+        """Average DEAD_PIXEL_FRAMES raw frames of the full sensor, flag the dead pixels, save the map."""
+        a = self._aoi
+        if a["width"] != self.cam.sensor_width or a["height"] != self.cam.sensor_height:
+            QtWidgets.QMessageBox.information(self, "Dead pixels", "Read out the full sensor first ('Full sensor' button): "
+                                              "the map is for the whole chip.")
+            return
+        if not self.timer.isActive():
+            QtWidgets.QMessageBox.information(self, "Dead pixels", "Start the live stream first.")
+            return
+        self._dead_accum = []
+        self.statusBar().showMessage(f"Averaging {self.DEAD_PIXEL_FRAMES} frames for the dead-pixel map…")
+
+    def _accumulate_dead(self, frame: np.ndarray):
+        self._dead_accum.append(frame.astype(np.float32))
+        if len(self._dead_accum) < self.DEAD_PIXEL_FRAMES:
+            return
+        stack = np.stack(self._dead_accum)
+        self._dead_accum = None
+        found = find_dead_pixels(stack)
+        mean = stack.mean(axis=0)
+        lit = float(np.percentile(mean, 90))
+        if lit < 20 * found["noise_sigma"] + 5:
+            QtWidgets.QMessageBox.warning(self, "Dead pixels", "The sensor is barely lit: a dead pixel cannot be told from "
+                                          "a dark one. Light the whole chip with a broad beam and try again.")
+            return
+        save_dead_pixels(self._dead_path, found,
+                         camera=getattr(self.cam, "sensor_name", type(self.cam).__name__),
+                         serial=getattr(self.cam, "serial", None),
+                         sensor=[self.cam.sensor_height, self.cam.sensor_width],
+                         n_frames=self.DEAD_PIXEL_FRAMES, exposure_us=self.cam.exposure_us, gain_db=self.cam.gain_db,
+                         level_90th_percentile=round(lit, 1))
+        self._set_dead_pixels(found["ys"], found["xs"], f"{len(found['ys'])} dead pixels, found just now")
+        self.dead_show.setChecked(True)
+        self.statusBar().showMessage(
+            f"{len(found['ys'])} dead pixels (noise σ {found['noise_sigma']:.2f} counts) saved to {self._dead_path}", 15000)
 
     def _update_status(self, now: float):
         fps = self._frames / (now - self._t_status)

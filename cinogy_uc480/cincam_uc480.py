@@ -355,6 +355,11 @@ class CinCamUC480:
 
     # ---------- Metadata cache ----------
 
+    @property
+    def dead_pixel_file(self) -> Path:
+        """JSON map of this camera's dead pixels (written by the live viewer), next to the driver."""
+        return Path(__file__).resolve().parent / f"dead_pixels_{self.serial}.json"
+
     def _query_static_metadata(self) -> dict:
         """
         Query camera metadata once and return JSON-safe values.
@@ -371,6 +376,7 @@ class CinCamUC480:
 
             "resolution": [self.sensor_height, self.sensor_width],
             "aoi": self.aoi,
+            "dead_pixel_file": str(self.dead_pixel_file) if self.dead_pixel_file.exists() else None,
 
             "exposure_us": self._get_exposure_us(),
             "gain_db": self._get_gain_db(),

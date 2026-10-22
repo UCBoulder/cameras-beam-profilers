@@ -1,0 +1,37 @@
+{
+ "camera": "C1285R12M",
+ "serial": "4104501758",
+ "sensor": [
+  1024,
+  1280
+ ],
+ "n_frames": 8,
+ "exposure_us": 8010.0,
+ "gain_db": 0.0,
+ "level_90th_percentile": 74.4,
+ "found": "2026-10-21T18:07:55",
+ "criterion": {
+  "min_drop": 0.3,
+  "sigma_factor": 8.0,
+  "smooth_factor": 3.0,
+  "n_frames": 8
+ },
+ "noise_sigma": 0.232,
+ "shot_noise_per_count": 0.0123,
+ "n_dead": 2,
+ "pixel_format": "[y, x, value, mean of the 8 neighbours] in sensor pixels, (0, 0) = top-left",
+ "pixels": [
+  [
+   316,
+   910,
+   14.5,
+   22.22
+  ],
+  [
+   411,
+   963,
+   11.25,
+   17.8
+  ]
+ ]
+}
