@@ -56,7 +56,7 @@ import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from .gaussian_fit import fit_gaussian_2d
-from .dead_pixels import find_dead_pixels, load_dead_pixels, repair, save_dead_pixels
+from .dead_pixels import all_bad_pixels, find_dead_pixels, load_dead_pixels, repair, save_dead_pixels
 
 # Beam-profiler colour scale, the same as PSFPlotter.BEAM_CMAP: dark blue ->
 # blue -> cyan -> green -> yellow -> red, white only at saturation
@@ -229,7 +229,7 @@ class LiveView(QtWidgets.QMainWindow):
         self._background_settings = None   # (exposure_us, gain_db) the background was taken with
         self._bg_slice = None       # part of the background covering the current readout
         self._frames, self._t_status = 0, time.perf_counter()
-        self._dead = (np.array([], int), np.array([], int))   # (ys, xs) in sensor pixels
+        self._dead = None           # dead pixels and dark spots (dead_pixels.py dict), sensor pixels
         self._dead_path = Path(getattr(cam, "dead_pixel_file", self.data_root / "dead_pixels.json"))
         self._dead_accum = None     # raw frames being averaged for "Find dead pixels"
 
@@ -349,8 +349,8 @@ class LiveView(QtWidgets.QMainWindow):
         self.dead_label.setWordWrap(True)
         find_dead = QtWidgets.QPushButton("Find dead pixels (lit sensor, full readout)")
         find_dead.clicked.connect(lambda: self.find_dead_pixels())
-        self.dead_ignore = QtWidgets.QCheckBox("Ignore dead pixels in fits")
-        self.dead_show = QtWidgets.QCheckBox("Show dead pixels")
+        self.dead_ignore = QtWidgets.QCheckBox("Ignore dead pixels and dark spots in fits")
+        self.dead_show = QtWidgets.QCheckBox("Show dead pixels (circles) and dark spots (dots)")
         self.dead_show.toggled.connect(self._show_dead)
 
         self.log_scale = QtWidgets.QCheckBox("Logarithmic colour scale")
@@ -412,8 +412,10 @@ class LiveView(QtWidgets.QMainWindow):
         self._fit = None          # last fit, in sensor pixel coordinates
         self._fit_time = 0.0
         self.dead_marks = pg.ScatterPlotItem(pen=pg.mkPen("r", width=1.5), brush=None, symbol="o", size=12)
-        self.dead_marks.setZValue(12)
-        self.plot.addItem(self.dead_marks)
+        self.spot_marks = pg.ScatterPlotItem(pen=None, brush=pg.mkBrush("r"), symbol="s", size=4)
+        for item in (self.dead_marks, self.spot_marks):
+            item.setZValue(12)
+            self.plot.addItem(item)
         self._load_dead_pixels()
         self._mouse_pos = None
         self.plot.scene().sigMouseMoved.connect(self._mouse_moved)
@@ -620,9 +622,8 @@ class LiveView(QtWidgets.QMainWindow):
         now = time.perf_counter()
         if not self.fit_on.isChecked() or now - self._fit_time < 1.0 / self.FIT_PER_SECOND:
             return
-        if self.dead_ignore.isChecked() and len(self._dead[0]):
-            ys, xs = self._dead
-            frame = repair(frame, ys - self._aoi["offset_y"], xs - self._aoi["offset_x"])
+        if self.dead_ignore.isChecked() and self._dead is not None:
+            frame = repair(frame, self._dead, offset=(self._aoi["offset_y"], self._aoi["offset_x"]))
         try:
             fit = fit_gaussian_2d(frame, self.fit_window.value())
         except RuntimeError as err:
@@ -671,14 +672,17 @@ class LiveView(QtWidgets.QMainWindow):
 
     def _load_dead_pixels(self):
         if self._dead_path.exists():
-            ys, xs, info = load_dead_pixels(self._dead_path)
-            self._set_dead_pixels(ys, xs, f"{len(ys)} dead pixels, found {info.get('found', '?')[:16]}")
+            found = load_dead_pixels(self._dead_path)
+            self._set_dead_pixels(found, f"found {found['info'].get('found', '?')[:16]}")
         else:
-            self._set_dead_pixels(np.array([], int), np.array([], int), "no dead-pixel map yet")
+            self._set_dead_pixels(None, "no dead-pixel map yet")
 
-    def _set_dead_pixels(self, ys, xs, text: str):
-        self._dead = (np.asarray(ys, int), np.asarray(xs, int))
-        have = len(ys) > 0
+    def _set_dead_pixels(self, found: dict | None, when: str):
+        self._dead = found
+        have = found is not None and (len(found["ys"]) > 0 or len(found["spots"]) > 0)
+        text = when if found is None else (
+            f"{len(found['ys'])} dead pixels, {len(found['spots'])} dark spots "
+            f"({sum(s['n_pixels'] for s in found['spots'])} px), {when}")
         self.dead_label.setText(f"{text}<br><span style='font-size: 8pt'>{self._dead_path}</span>")
         self.dead_label.setToolTip(str(self._dead_path))
         for w in (self.dead_ignore, self.dead_show):
@@ -687,11 +691,14 @@ class LiveView(QtWidgets.QMainWindow):
         self._show_dead()
 
     def _show_dead(self):
-        ys, xs = self._dead
-        if self.dead_show.isChecked() and len(ys):
+        if self.dead_show.isChecked() and self._dead is not None:
+            ys, xs = self._dead["ys"], self._dead["xs"]
             self.dead_marks.setData(xs + 0.5, ys + 0.5)   # pixel i spans [i, i + 1)
+            sy, sx = all_bad_pixels(dict(ys=[], xs=[], spots=self._dead["spots"]))
+            self.spot_marks.setData(sx + 0.5, sy + 0.5)
         else:
             self.dead_marks.setData([], [])
+            self.spot_marks.setData([], [])
 
     def find_dead_pixels(self):
         """Average DEAD_PIXEL_FRAMES raw frames of the full sensor, flag the dead pixels, save the map."""
@@ -725,10 +732,11 @@ class LiveView(QtWidgets.QMainWindow):
                          sensor=[self.cam.sensor_height, self.cam.sensor_width],
                          n_frames=self.DEAD_PIXEL_FRAMES, exposure_us=self.cam.exposure_us, gain_db=self.cam.gain_db,
                          level_90th_percentile=round(lit, 1))
-        self._set_dead_pixels(found["ys"], found["xs"], f"{len(found['ys'])} dead pixels, found just now")
+        self._set_dead_pixels(found, "found just now")
         self.dead_show.setChecked(True)
         self.statusBar().showMessage(
-            f"{len(found['ys'])} dead pixels (noise σ {found['noise_sigma']:.2f} counts) saved to {self._dead_path}", 15000)
+            f"{len(found['ys'])} dead pixels, {len(found['spots'])} dark spots (noise σ {found['noise_sigma']:.2f} counts) "
+            f"saved to {self._dead_path}", 15000)
 
     def _update_status(self, now: float):
         fps = self._frames / (now - self._t_status)

@@ -92,8 +92,9 @@ cam.stop_live()
 
 ## Dead pixels
 
-`dead_pixels_<serial>.json` in this folder is the camera's dead-pixel map, written by
-the live viewer ("Find dead pixels", see `examples/README.md`) and read by it at start;
+`dead_pixels_<serial>.json` in this folder is the camera's map of dead pixels and dark
+spots (dust on the sensor window), written by the live viewer ("Find dead pixels", see
+`examples/README.md`) and read by it at start;
 `cam.dead_pixel_file` gives the path and every snapshot's metadata records it under
 `dead_pixel_file`. Frames are never altered: the map is for analysis code
 (`camera_live_view.dead_pixels.load_dead_pixels` / `repair`).

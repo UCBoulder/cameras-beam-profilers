@@ -45,12 +45,15 @@ PATH); otherwise set `CINCAM_UC480_DLL` to the full path of `uc480_64.dll`.
   sensor (±1000 px): large windows are binned so that a fit stays at 10–20 ms, and a
   small spot inside a large window is automatically refitted unbinned. Set the window
   larger than the beam; a window smaller than the beam gives meaningless widths.
-- Dead pixels (same group): light the whole sensor with a broad beam, read out the full
-  sensor and press "Find dead pixels". Eight frames are averaged and a pixel is flagged
-  only if it is at least 30 % darker than every linear prediction from its neighbours, by
-  more than 8 × the measured noise, with smooth surroundings (an edge or a dust cluster
-  is not a dead pixel). The map is saved as JSON next to the driver
-  (`cinogy_uc480/dead_pixels_<serial>.json`, recorded in every snapshot's metadata),
-  loaded again at start, drawn on the image with "Show dead pixels" and, with "Ignore dead
-  pixels in fits", replaced by the mean of their neighbours before the Gaussian fit. Saved
-  frames are never altered.
+- Dead pixels and dark spots (same group): light the whole sensor with a clean, broad
+  beam, read out the full sensor and press "Find dead pixels". Eight frames are averaged
+  and two kinds of bad pixels are mapped. A *dead pixel* is a single pixel at least 30 %
+  darker than every linear prediction from its neighbours, by more than 8 × the measured
+  noise, with smooth surroundings (an edge is not a dead pixel). A *dark spot* is a patch
+  of 2 or more pixels below 70 % of the smooth local background (a median over 25 px),
+  again by more than 8 × the noise: dust or a speck on the sensor window. The map is
+  saved as JSON next to the driver (`cinogy_uc480/dead_pixels_<serial>.json`, recorded
+  in every snapshot's metadata), loaded again at start, drawn on the image with "Show
+  dead pixels" (circles for dead pixels, dots for spot pixels) and, with "Ignore … in
+  fits", replaced before the Gaussian fit: dead pixels by the mean of their neighbours,
+  spots by the mean of a ring around them. Saved frames are never altered.
