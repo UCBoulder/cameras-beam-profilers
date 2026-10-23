@@ -123,16 +123,15 @@ def waist_vs_position(folder, fig: Figure | None = None) -> Figure:
             continue
         zz = np.linspace(x_lo, x_hi, 400)
         curves.append(fit["curve"](zz))
-        err = f" ± {fit['z0_err']:.3f}" if np.isfinite(fit["z0_err"]) else " (3 points: no error estimate)"
-        where = "" if fit["inside"] else "  — outside the scanned range, extrapolated"
+        err = f" ± {fit['z0_err']:.3f}" if np.isfinite(fit["z0_err"]) else " (3 pts, no error)"
+        where = "" if fit["inside"] else ", extrapolated"
         ax.plot(zz, curves[-1], "-", color=colour, alpha=0.7,
-                label=f"fit w{axis}² = w0² + θ²(z − z0)²: focus z0 = {fit['z0']:+.3f}{err} {unit}, "
-                      f"w0 = {fit['w0']:.1f} {r['w_unit']}{where}")
+                label=f"fit {axis}: focus z0 = {fit['z0']:+.3f}{err} {unit}{where}; w0 = {fit['w0']:.1f} {r['w_unit']}")
         ax.axvline(fit["z0"], color=colour, ls=":", alpha=0.8)
     if len(foci) == 2:
         z_focus = float(np.mean(foci))
-        ax.axvline(z_focus, color="k", ls="--", label=f"estimated focal plane {z_focus:+.3f} {unit} (mean of x and y)")
-    title = f"{r['name']}: Gaussian waist vs position"
+        ax.axvline(z_focus, color="k", ls="--", label=f"focal plane {z_focus:+.3f} {unit} (mean of x and y)")
+    title = f"{r['name']}: Gaussian waist vs position\nfit per axis: w(z)² = w0² + θ²(z − z0)², focus at the minimum z0"
     if r["failed"]:
         title += f"   (no fit at {', '.join(f'{p:+.3f}' for p in r['failed'])} {unit})"
     if r["max_value"] and len(r["peaks"]) and r["peaks"].max() >= 0.99 * r["max_value"]:
