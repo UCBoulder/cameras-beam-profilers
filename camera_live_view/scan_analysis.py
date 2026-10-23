@@ -27,23 +27,44 @@ from .position_scan import PositionScan
 
 def parabola_focus(z: np.ndarray, w: np.ndarray) -> dict | None:
     """
-    Fit w² = a z² + b z + c and return the vertex: dict(z0, z0_err, w0, a, b, c,
-    curve(z)). None with fewer than 3 points or when the parabola opens downwards.
+    Fit w² = a z² + b z + c (a Gaussian beam's caustic) and return
+    dict(a, b, c, curve(z), z0, z0_err, w0, w_span, linear_zero, linear_slope, status):
+
+    - status "ok": the vertex z0 ± z0_err is the focus, w0 the waist there;
+    - status "unresolved": a > 0 but z0_err is larger than the scanned range, or
+      z0 lies further outside the scan than the scan is long: the radius hardly
+      changes over the scan (beam nearly collimated there, or the focus far away);
+    - status "no_minimum": the parabola opens downwards (a ≤ 0), so there is
+      no focus inside the scan; `linear_zero` is where a straight-line fit of
+      w(z) reaches zero, which bounds where the focus can be (a Gaussian caustic
+      flattens before reaching zero, so the focus is closer than that).
+
+    None with fewer than 3 points or all at the same position.
     """
     z, w = np.asarray(z, float), np.asarray(w, float)
     if len(z) < 3 or np.ptp(z) == 0:
         return None
     (a, b, c), cov = np.polyfit(z, w ** 2, 2, cov=len(z) > 3) if len(z) > 3 else (np.polyfit(z, w ** 2, 2), None)
+    fit = dict(a=float(a), b=float(b), c=float(c), z0=float("nan"), z0_err=float("nan"), w0=float("nan"),
+               curve=lambda zz: np.sqrt(np.maximum(a * np.asarray(zz) ** 2 + b * np.asarray(zz) + c, 0.0)))
+    slope, intercept = np.polyfit(z, w, 1)
+    fit["linear_zero"] = float(-intercept / slope) if slope != 0 else float("nan")
+    fit["linear_slope"] = float(slope)
+    fit["w_span"] = float(np.ptp(w))
     if a <= 0:
-        return None
+        fit["status"] = "no_minimum"
+        return fit
     z0 = -b / (2 * a)
     w0_sq = c - b ** 2 / (4 * a)
     z0_err = float("nan")
     if cov is not None:
         grad = np.array([b / (2 * a ** 2), -1 / (2 * a), 0.0])     # d z0 / d(a, b, c)
         z0_err = float(np.sqrt(max(grad @ cov @ grad, 0.0)))
-    return dict(z0=float(z0), z0_err=z0_err, w0=float(np.sqrt(max(w0_sq, 0.0))), a=float(a), b=float(b), c=float(c),
-                curve=lambda zz: np.sqrt(np.maximum(a * np.asarray(zz) ** 2 + b * np.asarray(zz) + c, 0.0)))
+    fit.update(z0=float(z0), z0_err=z0_err, w0=float(np.sqrt(max(w0_sq, 0.0))))
+    span = np.ptp(z)
+    unresolved = (np.isfinite(z0_err) and z0_err > span) or not (z.min() - span <= z0 <= z.max() + span)
+    fit["status"] = "unresolved" if unresolved else "ok"
+    return fit
 
 
 def fit_scan(folder) -> dict:
@@ -83,8 +104,8 @@ def waist_vs_position(folder, fig: Figure | None = None) -> Figure:
     r = fit_scan(folder)
     z, unit = r["positions"], r["unit"]
     fits = {axis: parabola_focus(z, r[f"w{axis}"]) for axis in ("x", "y")}
-    # x window: the scanned positions and the fitted foci (when not absurdly far), plus 5 %
-    foci = [f["z0"] for f in fits.values() if f is not None and z.min() - np.ptp(z) <= f["z0"] <= z.max() + np.ptp(z)]
+    # x window: the scanned positions and the resolved foci, plus 5 %
+    foci = [f["z0"] for f in fits.values() if f is not None and f["status"] == "ok"]
     x_lo, x_hi = min([z.min()] + foci), max([z.max()] + foci)
     pad = 0.05 * max(x_hi - x_lo, 1e-9)
     x_lo, x_hi = x_lo - pad, x_hi + pad
@@ -95,19 +116,35 @@ def waist_vs_position(folder, fig: Figure | None = None) -> Figure:
         w = r[f"w{axis}"]
         ax.plot(z, w, "o", color=colour, label=f"w{axis} (1/e² radius along {axis})")
         fit = fits[axis]
-        if fit is not None:
-            zz = np.linspace(x_lo, x_hi, 300)
+        if fit is None:
+            ax.plot([], [], " ", label=f"w{axis}: no parabola fit (needs 3 positions)")
+            continue
+        zz = np.linspace(x_lo, x_hi, 300)
+        curves.append(fit["curve"](zz))
+        if fit["status"] == "ok":
             err = f" ± {fit['z0_err']:.3f}" if np.isfinite(fit["z0_err"]) else " (3 points: no error estimate)"
-            outside = not (z.min() - np.ptp(z) <= fit["z0"] <= z.max() + np.ptp(z))
-            curves.append(fit["curve"](zz))
             ax.plot(zz, curves[-1], "-", color=colour, alpha=0.7,
-                    label=f"parabola fit of w{axis}²: focus at {fit['z0']:+.3f}{err} {unit}, "
-                          f"w0 = {fit['w0']:.1f} {r['w_unit']}" + ("  — far outside the scan, extend it" if outside else ""))
+                    label=f"parabola fit of w{axis}²: focus at {fit['z0']:+.3f}{err} {unit}, w0 = {fit['w0']:.1f} {r['w_unit']}")
             ax.axvline(fit["z0"], color=colour, ls=":", alpha=0.7)
             lines.append(fit["z0"])
+        elif fit["status"] == "no_minimum":
+            towards = "larger" if fit["linear_slope"] < 0 else "smaller"
+            ax.plot(zz, curves[-1], "--", color=colour, alpha=0.7,
+                    label=f"parabola fit of w{axis}²: opens downwards, no focus inside the scan.\n"
+                          f"   w{axis} shrinks towards {towards} positions; a straight line reaches 0 at "
+                          f"{fit['linear_zero']:+.1f} {unit},\n   the focus lies before that: extend the scan that way")
+        else:
+            ax.plot(zz, curves[-1], "--", color=colour, alpha=0.7,
+                    label=f"parabola fit of w{axis}²: focus not resolved (w{axis} changes by only {fit['w_span']:.1f} "
+                          f"{r['w_unit']} over the scan,\n   vertex at {fit['z0']:+.1f} ± {fit['z0_err']:.1f} {unit}): "
+                          f"move the scan towards it or make it longer")
     if len(lines) == 2:
         z_focus = float(np.mean(lines))
         ax.axvline(z_focus, color="k", ls="--", label=f"estimated focal plane {z_focus:+.3f} {unit} (mean of x and y)")
+    elif len(lines) == 1:
+        ax.plot([], [], " ", label="estimated focal plane: only one axis resolved, see above")
+    else:
+        ax.plot([], [], " ", label="estimated focal plane: not found in this scan")
     title = f"{r['name']}: Gaussian waist vs position"
     if r["failed"]:
         title += f"   (no fit at {', '.join(f'{p:+.3f}' for p in r['failed'])} {unit})"
