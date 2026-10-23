@@ -10,8 +10,8 @@ one later:
 waist_vs_position: a 2D Gaussian is fitted to every frame (gaussian_fit.py,
 dead pixels repaired when the scan recorded a map) and the 1/e² radii along
 the sensor x and y axes are plotted against position. A Gaussian beam's
-radius is fitted with a parabola w(z) = c (z − a)² + b (a, b, c free, linear
-least squares); its vertex a is the focus, marked with a vertical line, per
+radius is fitted with a parabola w(z) = c (z − a)² + b with c ≥ 0 and b ≥ 0
+(bounded least squares); its vertex a is the focus, marked with a vertical line, per
 axis and averaged (the two differ for an astigmatic beam). When the vertex
 lies outside the scan the plot says so; the error of a comes from the fit
 covariance.
@@ -19,6 +19,7 @@ covariance.
 
 import numpy as np
 from matplotlib.figure import Figure
+from scipy.optimize import least_squares
 
 from .dead_pixels import load_dead_pixels, repair
 from .gaussian_fit import fit_gaussian_2d
@@ -27,29 +28,39 @@ from .position_scan import PositionScan
 
 def parabola_focus(z: np.ndarray, w: np.ndarray) -> dict | None:
     """
-    Fit the parabola w(z) = c (z − a)² + b to the radii (a, b, c free, linear
-    least squares) and return dict(a, a_err, b, c, curve(z), inside): the
-    vertex a is the focus, b the radius there; `inside` says whether a lies
-    within the scanned range. None with fewer than 3 points or all at the
-    same position; with exactly 3 points the error is undefined (nan).
+    Fit the parabola w(z) = c (z − a)² + b to the radii with c ≥ 0 (opens
+    upwards) and b ≥ 0 (least squares with bounds) and return dict(a, a_err,
+    b, c, curve(z), inside): the vertex a is the focus, b the radius there;
+    `inside` says whether a lies within the scanned range. When the scan only
+    shows the radius falling, the vertex lands beyond the last point in that
+    direction. None with fewer than 3 points or all at the same position;
+    with exactly 3 points the error is undefined (nan).
     """
     z, w = np.asarray(z, float), np.asarray(w, float)
     if len(z) < 3 or np.ptp(z) == 0:
         return None
-    if len(z) > 3:
-        (p2, p1, p0), cov = np.polyfit(z, w, 2, cov=True)
+    # start values: the free parabola if it opens upwards, else a vertex past the
+    # end of the scan on the side the radius is falling towards
+    p2, p1, p0 = np.polyfit(z, w, 2)
+    slope = np.polyfit(z, w, 1)[0]
+    if p2 > 0 and p0 - p1 ** 2 / (4 * p2) >= 0:
+        start = (-p1 / (2 * p2), p0 - p1 ** 2 / (4 * p2), p2)
     else:
-        (p2, p1, p0), cov = np.polyfit(z, w, 2), None
-    if p2 == 0:
-        return None
-    a = -p1 / (2 * p2)
-    b = p0 - p1 ** 2 / (4 * p2)
+        a0 = z.max() + np.ptp(z) if slope < 0 else z.min() - np.ptp(z)
+        start = (a0, 0.5 * w.min(), 0.5 * w.min() / np.ptp(z) ** 2)
+    res = least_squares(lambda p: p[2] * (z - p[0]) ** 2 + p[1] - w, x0=start,
+                        bounds=((-np.inf, 0.0, 0.0), (np.inf, np.inf, np.inf)), x_scale="jac")
+    a, b, c = (float(v) for v in res.x)
     a_err = float("nan")
-    if cov is not None:
-        grad = np.array([p1 / (2 * p2 ** 2), -1 / (2 * p2), 0.0])     # d a / d(p2, p1, p0)
-        a_err = float(np.sqrt(max(grad @ cov @ grad, 0.0)))
-    return dict(a=float(a), a_err=a_err, b=float(b), c=float(p2),
-                curve=lambda zz: p2 * (np.asarray(zz, float) - a) ** 2 + b, inside=bool(z.min() <= a <= z.max()))
+    dof = len(z) - 3
+    if dof > 0:
+        try:
+            cov = np.linalg.inv(res.jac.T @ res.jac) * (res.fun @ res.fun) / dof
+            a_err = float(np.sqrt(max(cov[0, 0], 0.0)))
+        except np.linalg.LinAlgError:
+            pass
+    return dict(a=a, a_err=a_err, b=b, c=c, curve=lambda zz: c * (np.asarray(zz, float) - a) ** 2 + b,
+                inside=bool(z.min() <= a <= z.max()))
 
 
 def fit_scan(folder) -> dict:
