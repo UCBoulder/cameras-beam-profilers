@@ -70,7 +70,7 @@ def fit_scan(folder) -> dict:
         wx.append(rx * scale)
         wy.append(ry * scale)
         peaks.append(fit["peak"])
-    return dict(folder=str(scan.folder), name=scan.meta.get("name", ""), unit=scan.unit, w_unit=w_unit,
+    return dict(folder=str(scan.folder), name=scan.meta.get("name", ""), unit=scan.unit, w_unit=w_unit, px=scale,
                 positions=np.array(positions), wx=np.array(wx), wy=np.array(wy), peaks=np.array(peaks),
                 failed=failed, max_value=cam.get("max_value"))
 
@@ -110,7 +110,13 @@ def waist_vs_position(folder, fig: Figure | None = None) -> Figure:
     ax.set_title(title, fontsize=10)
     ax.set_xlabel(f"position ({unit})")
     ax.set_ylabel(f"1/e² radius ({r['w_unit']})")
-    ax.set_ylim(bottom=0)
+    # initial ranges: the measured radii ± 20 px, the scanned positions ± 10 %
+    margin = 20 * r["px"]
+    w_all = np.concatenate([r["wx"], r["wy"]])
+    if len(w_all):
+        ax.set_ylim(max(w_all.min() - margin, 0), w_all.max() + margin)
+    if len(z) > 1:
+        ax.set_xlim(z.min() - 0.1 * np.ptp(z), z.max() + 0.1 * np.ptp(z))
     ax.grid(alpha=0.3)
     ax.legend(fontsize=8)
     fig.tight_layout()
