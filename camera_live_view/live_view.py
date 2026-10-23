@@ -349,6 +349,7 @@ class LiveView(QtWidgets.QMainWindow):
         self.fit_ellipse.setChecked(True)
         for w in (self.fit_units, self.fit_origin):
             w.currentIndexChanged.connect(self._show_fit)
+            w.currentIndexChanged.connect(lambda _: self._show_mark())
         self.fit_ellipse.toggled.connect(self._show_fit)
         fit_form = QtWidgets.QFormLayout()
         fit_form.addRow("Units", self.fit_units)
@@ -370,6 +371,24 @@ class LiveView(QtWidgets.QMainWindow):
         self.dead_show.setToolTip("Circles: dead pixels; dots: dark-spot pixels")
         self.dead_show.toggled.connect(self._show_dead)
 
+        # position marker: a cross at the most recent Gaussian centre, named in the legend
+        self.mark_name = QtWidgets.QLineEdit("marked centre")
+        self.mark_name.setToolTip("Legend name of the marker, e.g. 'optical axis'")
+        self.mark_name.textChanged.connect(lambda _: self._show_mark())
+        mark_btn = QtWidgets.QPushButton("Mark centre")
+        mark_btn.setToolTip("Put a cross at the most recent Gaussian centre (click again to move it there)")
+        mark_btn.clicked.connect(lambda: self.mark_centre())
+        unmark_btn = QtWidgets.QPushButton("Remove mark")
+        unmark_btn.clicked.connect(lambda: self.remove_mark())
+        mark_row = QtWidgets.QHBoxLayout()
+        mark_row.addWidget(mark_btn)
+        mark_row.addWidget(unmark_btn)
+        mark_form = QtWidgets.QFormLayout()
+        mark_form.addRow("Marker", self.mark_name)
+        mark_form.addRow(mark_row)
+        mark_widget = QtWidgets.QWidget()
+        mark_widget.setLayout(mark_form)
+
         self.log_scale = QtWidgets.QCheckBox("Logarithmic colour scale")
         self.log_scale.setChecked(True)
         self.log_scale.toggled.connect(self._set_colour_scale)
@@ -380,7 +399,7 @@ class LiveView(QtWidgets.QMainWindow):
         layout.addWidget(self._group("Gain", self.gain))
         layout.addWidget(self._group("Readout region (camera)", roi_widget, apply, full, self.show_roi))
         layout.addWidget(self._group("Background", self.bg_label, record, load, self.subtract, self.bg_warning))
-        layout.addWidget(self._group("Gaussian fit", self.fit_on, fit_widget, self.fit_ellipse,
+        layout.addWidget(self._group("Gaussian fit", self.fit_on, fit_widget, self.fit_ellipse, mark_widget,
                                      self.dead_label, find_dead, self.dead_ignore, self.dead_show))
         layout.addWidget(self._group("Display", self.log_scale))
         layout.addStretch(1)
@@ -688,6 +707,16 @@ class LiveView(QtWidgets.QMainWindow):
             item.setZValue(12)
             self.plot.addItem(item)
         self._load_dead_pixels()
+        self.legend = self.plot.addLegend(offset=(10, 10))
+        self.mark_item = pg.ScatterPlotItem(symbol="+", size=26, pen=pg.mkPen("m", width=2.5), brush=None, pxMode=True)
+        self.mark_item.setZValue(13)
+        self.plot.addItem(self.mark_item)
+        store = QtCore.QSettings(*self._settings)
+        self._mark = store.value("mark", None)       # (x0, y0) in sensor pixels, remembered between runs
+        if self._mark is not None:
+            self._mark = tuple(float(v) for v in self._mark)
+            self.mark_name.setText(store.value("mark_name", "marked centre"))
+        self._show_mark()
         self._mouse_pos = None
         self.plot.scene().sigMouseMoved.connect(self._mouse_moved)
 
@@ -916,10 +945,7 @@ class LiveView(QtWidgets.QMainWindow):
             self.fit_curve.setData([], [])
             return
         scale, unit = self.fit_units.currentData(), "px" if self.fit_units.currentIndex() == 0 else "µm"
-        x, y = fit["x0"], fit["y0"]
-        if self.fit_origin.currentIndex() == 1:       # (0, 0) at the centre of the sensor
-            x -= (self.cam.sensor_width - 1) / 2
-            y -= (self.cam.sensor_height - 1) / 2
+        x, y = self._in_fit_frame(fit["x0"], fit["y0"])
         # ellipticity as in ISO 11146: minor / major radius (1 = round); angle of the major axis from +x
         w_major, w_minor = max(fit["wx"], fit["wy"]), min(fit["wx"], fit["wy"])
         major_deg = np.degrees(fit["theta"]) + (90 if fit["wy"] > fit["wx"] else 0)
@@ -944,6 +970,38 @@ class LiveView(QtWidgets.QMainWindow):
         xs = np.concatenate([cx + ex * c - ey * s_, [np.nan, cx - wx * c, cx + wx * c, np.nan, cx + wy * s_, cx - wy * s_]])
         ys = np.concatenate([cy + ex * s_ + ey * c, [np.nan, cy - wx * s_, cy + wx * s_, np.nan, cy - wy * c, cy + wy * c]])
         self.fit_curve.setData(xs, ys)
+
+    def _in_fit_frame(self, x0: float, y0: float) -> tuple[float, float]:
+        """Sensor pixel coordinates -> the origin chosen in the fit menu (still in pixels)."""
+        if self.fit_origin.currentIndex() == 1:       # (0, 0) at the centre of the sensor
+            return x0 - (self.cam.sensor_width - 1) / 2, y0 - (self.cam.sensor_height - 1) / 2
+        return x0, y0
+
+    # ---------- position marker ----------
+
+    def mark_centre(self):
+        """Put the cross at the most recent Gaussian centre."""
+        if self._fit is None or "error" in self._fit:
+            QtWidgets.QMessageBox.information(self, "Mark centre", "No Gaussian fit yet: switch the fit on.")
+            return
+        self._mark = (self._fit["x0"], self._fit["y0"])
+        self._show_mark()
+
+    def remove_mark(self):
+        self._mark = None
+        self._show_mark()
+
+    def _show_mark(self):
+        self.legend.removeItem(self.mark_item)
+        if self._mark is None:
+            self.mark_item.setData([], [])
+            return
+        x0, y0 = self._mark
+        self.mark_item.setData([x0 + 0.5], [y0 + 0.5])       # pixel i spans [i, i + 1)
+        scale, unit = self.fit_units.currentData(), "px" if self.fit_units.currentIndex() == 0 else "µm"
+        x, y = self._in_fit_frame(x0, y0)
+        self.legend.addItem(self.mark_item, f"{self.mark_name.text().strip() or 'marked centre'}: "
+                                            f"x = {x * scale:.2f}, y = {y * scale:.2f} {unit}")
 
     # ---------- dead pixels ----------
 
@@ -1081,6 +1139,8 @@ class LiveView(QtWidgets.QMainWindow):
         store = QtCore.QSettings(*self._settings)
         store.setValue("geometry", self.saveGeometry())
         store.setValue("state", self.saveState())
+        store.setValue("mark", list(self._mark) if self._mark is not None else None)
+        store.setValue("mark_name", self.mark_name.text())
         self.set_live(False)
         super().closeEvent(event)
 
