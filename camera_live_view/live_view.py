@@ -443,7 +443,8 @@ class LiveView(QtWidgets.QMainWindow):
         self.scan_pos.setDecimals(3)
         self.scan_pos.setEnabled(False)
         self.scan_pos.setToolTip("Where the camera is for the next snapshot (input unit). Pre-filled with the last "
-                                 "position + step; type any value for a custom step.")
+                                 "position + the last step taken; type any value for a custom step and the "
+                                 "following suggestions keep that spacing.")
         self.scan_pos.valueChanged.connect(lambda _: self._scan_say(self.scan_status.text()))
         form.addRow("Name", self.scan_name)
         form.addRow("Start position", self.scan_start)
@@ -563,7 +564,12 @@ class LiveView(QtWidgets.QMainWindow):
         path = self._scan.add(taken, self._raw_last, exposure_us=self.cam.exposure_us,
                               gain_db=self.cam.gain_db, aoi=dict(a))
         peak = int(self._raw_last.max())
-        step_mm = self._scan.meta["step"]
+        # the next suggestion follows the most recent increment (a typed custom step is kept),
+        # the configured step until there are two snapshots
+        snaps = self._scan.meta["snapshots"]
+        step_mm = snaps[-1]["position"] - snaps[-2]["position"] if len(snaps) >= 2 else self._scan.meta["step"]
+        if step_mm == 0:
+            step_mm = self._scan.meta["step"]
         self._set_scan_next(taken + step_mm)
         self._scan_buttons(True)
         warn = "<br><span style='color: red'>Saturated: lower the exposure and drop this snapshot.</span>" \

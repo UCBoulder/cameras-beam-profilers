@@ -45,7 +45,8 @@ PATH); otherwise set `CINCAM_UC480_DLL` to the full path of `uc480_64.dll`.
   **focal plane scan**. Enter a name, the start position and the step (typed in mm, inch
   or µm; positions are stored and analysed in mm), start the scan, take a snapshot, move
   the camera by the step (or by anything else: "Next snapshot at" is pre-filled with the
-  last position + step and can be edited before each snapshot),
+  last position + the last step taken and can be edited before each snapshot, so a typed
+  custom step is kept for the following suggestions),
   take the next, … and finish. The raw frames go to `data/alignment_data/<name>_<time>/`
   as `data_<position><unit>.npy` next to `scan.json`, which lists every position with the
   exposure, gain and readout region, plus the camera metadata (`camera_live_view.
