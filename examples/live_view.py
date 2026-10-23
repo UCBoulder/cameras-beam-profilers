@@ -29,8 +29,10 @@ CONFIG = {
     "experiment": "live view",   # default experiment name in the save dialog
     "alvium": {                  # extra settings for Allied Vision cameras
         "camera_id": None,       # None: the first real camera found (Vimba X simulators are skipped)
-        "pixel_size_um": None,   # e.g. 3.45 for a Mako G-131B; Vimba does not report it
+        "pixel_size_um": None,   # e.g. 3.45 for a Mako G-319B; Vimba does not report it
         "use_camera_roi": False, # start with the full sensor
+        "packet_size": None,     # GigE (Mako): None lets Vimba pick the packet size the link carries;
+                                 # 1500 if frames still arrive incomplete (USB-to-Ethernet adapters)
     },
 }
 

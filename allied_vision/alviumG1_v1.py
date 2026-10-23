@@ -176,6 +176,8 @@ class AlviumG1:
                 f"  Underlying error: {exc}"
             ) from exc
 
+        self._set_packet_size()
+
         # Keep whatever AOI the camera already has (e.g. set in Vimba X Viewer)
         # unless the caller asked for the full sensor.
         if self._cfg.get("use_camera_roi", True):
@@ -187,6 +189,29 @@ class AlviumG1:
                 print(f"AOI: {w} {h} {offx} {offy}")
         else:
             self._uncrop_camera()
+
+    def _set_packet_size(self):
+        """
+        GigE cameras (Mako): the network packet size must fit the link. A camera
+        left at jumbo packets (8228 bytes) behind a USB-to-Ethernet adapter or an
+        unconfigured switch delivers only incomplete frames. Uses the config key
+        "packet_size" (bytes) when given, else lets Vimba negotiate the largest
+        size the link carries (GVSPAdjustPacketSize), else falls back to 1500.
+        """
+        if (size := self._optional("GevSCPSPacketSize")) is None:
+            return                                   # not a GigE camera
+        wanted = self._cfg.get("packet_size")
+        if wanted is None:
+            try:
+                stream = self.cam.get_streams()[0]
+                stream.GVSPAdjustPacketSize.run()
+                while not stream.GVSPAdjustPacketSize.is_done():
+                    time.sleep(0.01)
+            except (vpy.VmbError, AttributeError, IndexError):
+                wanted = 1500
+        if wanted is not None:
+            size.set(int(wanted))
+        print(f"[Camera] GigE packet size: {size.get()} bytes")
 
     def close(self):
         try:
@@ -465,6 +490,9 @@ class AlviumG1:
         self.cam.AcquisitionMode.set("Continuous")
 
         frame = self.cam.get_frame(timeout_ms=2000)
+        if frame.get_status() != vpy.FrameStatus.Complete:
+            raise RuntimeError(f"[Camera] Frame arrived {frame.get_status().name}: the network drops packets. "
+                               f"Lower the packet size (config 'packet_size': 1500) or fix the link.")
         if frame.get_pixel_format() != self.px_format:
             frame = frame.convert_pixel_format(self.px_format)
 
@@ -482,7 +510,7 @@ class AlviumG1:
         """Stream frames into a one-frame buffer (see grab_latest)."""
         if self._live:
             return
-        self._latest, self._frame_count, self._t_live = None, 0, time.perf_counter()
+        self._latest, self._frame_count, self._incomplete, self._t_live = None, 0, 0, time.perf_counter()
         self.cam.AcquisitionMode.set("Continuous")
         self.cam.start_streaming(self._on_frame, buffer_count=5)
         self._live = True
@@ -506,6 +534,12 @@ class AlviumG1:
                 with self._lock:
                     self._latest = img
                     self._frame_count += 1
+            else:
+                with self._lock:
+                    self._incomplete += 1
+                if self._incomplete == 20 and self._frame_count == 0:
+                    print("[Camera] Only incomplete frames arrive: the network drops packets. "
+                          "Lower the packet size (config 'packet_size': 1500) or fix the link.")
         finally:
             cam.queue_frame(frame)
 

@@ -34,6 +34,10 @@ PATH); otherwise set `CINCAM_UC480_DLL` to the full path of `uc480_64.dll`.
 
 - **One program per camera.** Close RayCi, ThorCam or Vimba X Viewer before running a
   script; a crashed script can also keep the camera until its Python process ends.
+- **Mako over GigE:** the packet size must fit the link. The driver lets Vimba negotiate
+  it at connection; if frames still arrive incomplete (typical behind a USB-to-Ethernet
+  adapter, which drops jumbo packets) set `"packet_size": 1500` in the config. Incomplete
+  frames are reported as an error, never saved.
 - Every camera writes the same folders, `data/<experiment>/snapshot_<timestamp>/` with
   `data_*.npy` (raw frame, uint16), `preview_*.png` and `metadata_*.json`. `data/` is
   ignored by git.
