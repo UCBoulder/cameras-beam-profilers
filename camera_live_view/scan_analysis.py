@@ -10,62 +10,46 @@ one later:
 waist_vs_position: a 2D Gaussian is fitted to every frame (gaussian_fit.py,
 dead pixels repaired when the scan recorded a map) and the 1/e² radii along
 the sensor x and y axes are plotted against position. A Gaussian beam's
-radius follows w(z)² = w0² + θ²(z − z0)²: an upward parabola in z with the
-offset w0². That parabola (w0, z0, θ ≥ 0) is fitted to the radii by least
-squares; its minimum z0 is the focus, marked with a vertical line, per axis
-and averaged (the two differ for an astigmatic beam). When the scan does
-not reach the focus the fit extrapolates and says so; the error of z0
-comes from the fit covariance.
+radius is fitted with a parabola w(z) = c (z − a)² + b (a, b, c free, linear
+least squares); its vertex a is the focus, marked with a vertical line, per
+axis and averaged (the two differ for an astigmatic beam). When the vertex
+lies outside the scan the plot says so; the error of a comes from the fit
+covariance.
 """
 
 import numpy as np
 from matplotlib.figure import Figure
-from scipy.optimize import least_squares
 
 from .dead_pixels import load_dead_pixels, repair
 from .gaussian_fit import fit_gaussian_2d
 from .position_scan import PositionScan
 
 
-def caustic(z, w0, z0, theta):
-    """w(z) = sqrt(w0² + θ² (z − z0)²): the upward parabola in w² with offset w0²."""
-    return np.sqrt(w0 ** 2 + theta ** 2 * (np.asarray(z, float) - z0) ** 2)
-
-
 def parabola_focus(z: np.ndarray, w: np.ndarray) -> dict | None:
     """
-    Least-squares fit of caustic() to the radii w(z) with w0 ≥ 0 and θ ≥ 0,
-    so the parabola in w² always opens upwards. Returns dict(z0, z0_err, w0,
-    w0_err, theta, curve(z), inside): the minimum z0 is the focus; `inside`
-    says whether it lies within the scanned range. None with fewer than 3
-    points (3 parameters) or all at the same position; with exactly 3
-    points the errors are undefined (nan).
+    Fit the parabola w(z) = c (z − a)² + b to the radii (a, b, c free, linear
+    least squares) and return dict(a, a_err, b, c, curve(z), inside): the
+    vertex a is the focus, b the radius there; `inside` says whether a lies
+    within the scanned range. None with fewer than 3 points or all at the
+    same position; with exactly 3 points the error is undefined (nan).
     """
     z, w = np.asarray(z, float), np.asarray(w, float)
     if len(z) < 3 or np.ptp(z) == 0:
         return None
-    # start values: the vertex of the free quadratic in w² when it opens upwards,
-    # else the zero of the straight line through w(z) (the beam converges towards it)
-    a, b, c = np.polyfit(z, w ** 2, 2)
-    slope, intercept = np.polyfit(z, w, 1)
-    if a > 0:
-        z0_start, w0_start = -b / (2 * a), np.sqrt(max(c - b ** 2 / (4 * a), 0.0))
+    if len(z) > 3:
+        (p2, p1, p0), cov = np.polyfit(z, w, 2, cov=True)
     else:
-        z0_start, w0_start = (-intercept / slope if slope != 0 else z.mean()), 0.2 * w.min()
-    theta_start = max(abs(slope), np.ptp(w) / np.ptp(z), 1e-6 * w.max() / np.ptp(z))
-    res = least_squares(lambda p: caustic(z, *p) - w, x0=(max(w0_start, 1e-3 * w.min()), z0_start, theta_start),
-                        bounds=((0.0, -np.inf, 0.0), (np.inf, np.inf, np.inf)), x_scale="jac")
-    w0, z0, theta = (float(v) for v in res.x)
-    errs = (float("nan"), float("nan"))
-    dof = len(z) - 3
-    if dof > 0:
-        try:
-            cov = np.linalg.inv(res.jac.T @ res.jac) * (res.fun @ res.fun) / dof
-            errs = (float(np.sqrt(cov[0, 0])), float(np.sqrt(cov[1, 1])))
-        except np.linalg.LinAlgError:
-            pass
-    return dict(z0=z0, z0_err=errs[1], w0=w0, w0_err=errs[0], theta=theta,
-                curve=lambda zz: caustic(zz, w0, z0, theta), inside=bool(z.min() <= z0 <= z.max()))
+        (p2, p1, p0), cov = np.polyfit(z, w, 2), None
+    if p2 == 0:
+        return None
+    a = -p1 / (2 * p2)
+    b = p0 - p1 ** 2 / (4 * p2)
+    a_err = float("nan")
+    if cov is not None:
+        grad = np.array([p1 / (2 * p2 ** 2), -1 / (2 * p2), 0.0])     # d a / d(p2, p1, p0)
+        a_err = float(np.sqrt(max(grad @ cov @ grad, 0.0)))
+    return dict(a=float(a), a_err=a_err, b=float(b), c=float(p2),
+                curve=lambda zz: p2 * (np.asarray(zz, float) - a) ** 2 + b, inside=bool(z.min() <= a <= z.max()))
 
 
 def fit_scan(folder) -> dict:
@@ -106,7 +90,7 @@ def waist_vs_position(folder, fig: Figure | None = None) -> Figure:
     r = fit_scan(folder)
     z, unit = r["positions"], r["unit"]
     fits = {axis: parabola_focus(z, r[f"w{axis}"]) for axis in ("x", "y")}
-    foci = [f["z0"] for f in fits.values() if f is not None]
+    foci = [f["a"] for f in fits.values() if f is not None]
     # x window: the scanned positions and the foci (extrapolated or not), plus 5 %
     x_lo, x_hi = min([z.min()] + foci), max([z.max()] + foci)
     pad = 0.05 * max(x_hi - x_lo, 1e-9)
@@ -123,15 +107,15 @@ def waist_vs_position(folder, fig: Figure | None = None) -> Figure:
             continue
         zz = np.linspace(x_lo, x_hi, 400)
         curves.append(fit["curve"](zz))
-        err = f" ± {fit['z0_err']:.3f}" if np.isfinite(fit["z0_err"]) else " (3 pts, no error)"
-        where = "" if fit["inside"] else ", extrapolated"
+        err = f" ± {fit['a_err']:.3f}" if np.isfinite(fit["a_err"]) else " (3 pts, no error)"
+        where = "" if fit["inside"] else ", outside the scan"
         ax.plot(zz, curves[-1], "-", color=colour, alpha=0.7,
-                label=f"fit {axis}: focus z0 = {fit['z0']:+.3f}{err} {unit}{where}; w0 = {fit['w0']:.1f} {r['w_unit']}")
-        ax.axvline(fit["z0"], color=colour, ls=":", alpha=0.8)
+                label=f"fit {axis}: focus a = {fit['a']:+.3f}{err} {unit}{where}; b = {fit['b']:.1f} {r['w_unit']}")
+        ax.axvline(fit["a"], color=colour, ls=":", alpha=0.8)
     if len(foci) == 2:
         z_focus = float(np.mean(foci))
         ax.axvline(z_focus, color="k", ls="--", label=f"focal plane {z_focus:+.3f} {unit} (mean of x and y)")
-    title = f"{r['name']}: Gaussian waist vs position\nfit per axis: w(z)² = w0² + θ²(z − z0)², focus at the minimum z0"
+    title = f"{r['name']}: Gaussian waist vs position\nfit per axis: w(z) = c (z − a)² + b, focus at the vertex a"
     if r["failed"]:
         title += f"   (no fit at {', '.join(f'{p:+.3f}' for p in r['failed'])} {unit})"
     if r["max_value"] and len(r["peaks"]) and r["peaks"].max() >= 0.99 * r["max_value"]:
