@@ -68,8 +68,7 @@ def fit_scan(folder) -> dict:
     scan = PositionScan.load(folder)
     cam = scan.meta.get("camera", {})
     dead = load_dead_pixels(cam["dead_pixel_file"]) if cam.get("dead_pixel_file") else None
-    pixel_um = cam.get("pixel_size_um")
-    scale, w_unit = (float(pixel_um), "µm") if pixel_um else (1.0, "px")
+    scale, w_unit = 1.0, "px"          # radii in pixels (pixel size: cam.get("pixel_size_um"))
     positions, wx, wy, peaks, failed = [], [], [], [], []
     for entry in scan.entries:
         frame = scan.frame(entry)
