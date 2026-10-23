@@ -707,7 +707,8 @@ class LiveView(QtWidgets.QMainWindow):
             item.setZValue(12)
             self.plot.addItem(item)
         self._load_dead_pixels()
-        self.legend = self.plot.addLegend(offset=(10, 10))
+        self.legend = self.plot.addLegend(offset=(-10, 10), brush=(0, 0, 0, 170), pen="w",   # top right, readable
+                                          labelTextColor="w", labelTextSize="10pt")
         self.mark_item = pg.ScatterPlotItem(symbol="+", size=26, pen=pg.mkPen("m", width=2.5), brush=None, pxMode=True)
         self.mark_item.setZValue(13)
         self.plot.addItem(self.mark_item)
