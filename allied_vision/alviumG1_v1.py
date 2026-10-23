@@ -13,9 +13,20 @@ Design principles
 - Camera configuration is slow and happens once
 - Snapshots are fast and never query hardware
 - All camera metadata is cached internally
+
+Live mode (for camera_live_view): start_live() streams frames into a
+one-frame buffer that grab_latest() empties; stop_live() ends it. Exposure
+and gain can be changed while streaming; set_aoi() / reset_aoi() restart the
+stream around the change. The properties exposure_us, gain_db, aoi,
+sensor_width / sensor_height, pixel_size_um (from the config, the camera does
+not report it) and the ranges exposure_range_us() / gain_range_db() complete
+the interface. Alvium and Mako (GigE) cameras share it; features whose names
+differ between the families are looked up by _feature().
 """
 
 import json
+import threading
+import time
 
 import numpy as np
 from pathlib import Path
@@ -181,6 +192,10 @@ class AlviumG1:
         try:
             if hasattr(self, "cam"):
                 try:
+                    self.stop_live()
+                except vpy.VmbError:
+                    pass
+                try:
                     self.cam.set_pixel_format(vpy.PixelFormat.Mono8)
                 except vpy.VmbError:
                     pass
@@ -255,12 +270,14 @@ class AlviumG1:
 
         w_inc = self.cam.Width.get_increment()
         h_inc = self.cam.Height.get_increment()
+        ox_inc = self.cam.OffsetX.get_increment() or 1
+        oy_inc = self.cam.OffsetY.get_increment() or 1
 
         # Clamp offset and size to valid hardware ranges, then align to increment
-        ox = int(np.clip(offset_px[0], offx_min, w_max - w_min))
-        oy = int(np.clip(offset_px[1], offy_min, h_max - h_min))
-        w  = (int(np.clip(width_px,  w_min, w_max - ox)) // w_inc) * w_inc
-        h  = (int(np.clip(height_px, h_min, h_max - oy)) // h_inc) * h_inc
+        ox = (int(np.clip(offset_px[0], offx_min, w_max - w_min)) // ox_inc) * ox_inc
+        oy = (int(np.clip(offset_px[1], offy_min, h_max - h_min)) // oy_inc) * oy_inc
+        w  = max((int(np.clip(width_px,  w_min, w_max - ox)) // w_inc) * w_inc, w_min)
+        h  = max((int(np.clip(height_px, h_min, h_max - oy)) // h_inc) * h_inc, h_min)
 
         # Alvium requires: reset offsets → set size → set offsets
         self.cam.OffsetX.set(offx_min)
@@ -310,9 +327,9 @@ class AlviumG1:
             ],
 
             "exposure_us": float(self._feature(self._EXPOSURE_TIME).get()),
-            "gain_db": float(self.cam.Gain.get()),
-            "exposure_auto": str(self.cam.ExposureAuto.get()),
-            "gain_auto": str(self.cam.GainAuto.get()),
+            "gain_db": self.gain_db,
+            "exposure_auto": str(f.get()) if (f := self._optional("ExposureAuto")) is not None else None,
+            "gain_auto": str(f.get()) if (f := self._optional("GainAuto")) is not None else None,
         }
         return metadata
 
@@ -332,11 +349,19 @@ class AlviumG1:
                 pass
         raise AttributeError(f"Camera '{self.camera_id}' has none of the features {names}")
 
+    def _optional(self, name: str):
+        """The feature `name`, or None when this camera (or the Vimba simulator) lacks it."""
+        try:
+            return self.cam.get_feature_by_name(name)
+        except vpy.VmbFeatureError:
+            return None
+
     def set_exposure(self, exposure_us: float):
         """
         Set camera exposure time (microseconds).
         """
-        self.cam.ExposureAuto.set("Off")
+        if (auto := self._optional("ExposureAuto")) is not None:
+            auto.set("Off")
         self._feature(self._EXPOSURE_TIME).set(exposure_us)
 
         self._camera_metadata["exposure_us"] = exposure_us
@@ -347,8 +372,12 @@ class AlviumG1:
         Set camera analog gain (dB).
         """
 
-        self.cam.GainAuto.set("Off")
-        self.cam.Gain.set(gain_db)
+        if (auto := self._optional("GainAuto")) is not None:
+            auto.set("Off")
+        if (gain := self._optional("Gain")) is None:
+            print("[Camera] This camera has no Gain feature; gain not set.")
+            return
+        gain.set(gain_db)
 
         self._camera_metadata["gain_db"] = gain_db
         self._camera_metadata["gain_auto"] = False
@@ -357,16 +386,16 @@ class AlviumG1:
         """
         Enable or disable automatic exposure.
         """
-
-        self.cam.ExposureAuto.set("Continuous" if enabled else "Off")
+        if (auto := self._optional("ExposureAuto")) is not None:
+            auto.set("Continuous" if enabled else "Off")
         self._camera_metadata["exposure_auto"] = enabled
 
     def set_gain_auto(self, enabled: bool = True):
         """
         Enable or disable automatic gain.
         """
-
-        self.cam.GainAuto.set("Continuous" if enabled else "Off")
+        if (auto := self._optional("GainAuto")) is not None:
+            auto.set("Continuous" if enabled else "Off")
         self._camera_metadata["gain_auto"] = enabled
 
     def set_pixel_format(self, format="auto"):
@@ -422,6 +451,16 @@ class AlviumG1:
             Raw camera image (uint16, values 0 to self.max_value).
         """
 
+        if self._live:                      # get_frame() is not allowed while streaming: take the next live frame
+            t0 = time.perf_counter()
+            img = self.grab_latest()
+            while img is None and time.perf_counter() - t0 < 2.0:
+                time.sleep(0.005)
+                img = self.grab_latest()
+            if img is None:
+                raise RuntimeError("[Camera] No frame from the live stream within 2 s")
+            return img
+
         prev_mode = self.cam.AcquisitionMode.get()
         self.cam.AcquisitionMode.set("Continuous")
 
@@ -433,6 +472,115 @@ class AlviumG1:
 
         img = frame.as_numpy_ndarray()[:, :, 0]
         return img.astype(np.uint16, copy=False)
+
+    # ---------- Live mode ----------
+
+    _live = False
+    _lock = threading.Lock()
+
+    def start_live(self):
+        """Stream frames into a one-frame buffer (see grab_latest)."""
+        if self._live:
+            return
+        self._latest, self._frame_count, self._t_live = None, 0, time.perf_counter()
+        self.cam.AcquisitionMode.set("Continuous")
+        self.cam.start_streaming(self._on_frame, buffer_count=5)
+        self._live = True
+
+    def stop_live(self):
+        if self._live:
+            self._live = False
+            self.cam.stop_streaming()
+
+    @property
+    def live(self) -> bool:
+        return self._live
+
+    def _on_frame(self, cam, stream, frame):
+        """vmbpy frame handler (runs in a Vimba thread): keep the newest complete frame."""
+        try:
+            if frame.get_status() == vpy.FrameStatus.Complete:
+                converted = frame if frame.get_pixel_format() == self.px_format \
+                    else frame.convert_pixel_format(self.px_format)
+                img = converted.as_numpy_ndarray()[:, :, 0].astype(np.uint16)   # copies out of the buffer
+                with self._lock:
+                    self._latest = img
+                    self._frame_count += 1
+        finally:
+            cam.queue_frame(frame)
+
+    def grab_latest(self) -> np.ndarray | None:
+        """The newest frame since the previous call, or None."""
+        with self._lock:
+            img, self._latest = self._latest, None
+        return img
+
+    def frame_rate(self) -> float:
+        """Frames received per second since the previous call (measured)."""
+        now = time.perf_counter()
+        with self._lock:
+            n, self._frame_count = self._frame_count, 0
+        dt, self._t_live = now - self._t_live, now
+        return n / dt if dt > 0 else 0.0
+
+    # ---------- Viewer interface: current values, ranges, readout region ----------
+
+    @property
+    def exposure_us(self) -> float:
+        return float(self._feature(self._EXPOSURE_TIME).get())
+
+    @property
+    def gain_db(self) -> float:
+        try:
+            return float(self.cam.Gain.get())
+        except (vpy.VmbFeatureError, AttributeError):
+            return 0.0
+
+    def exposure_range_us(self) -> tuple[float, float]:
+        lo, hi = self._feature(self._EXPOSURE_TIME).get_range()
+        return float(lo), float(hi)
+
+    def gain_range_db(self) -> tuple[float, float]:
+        try:
+            lo, hi = self.cam.Gain.get_range()
+            return float(lo), float(hi)
+        except (vpy.VmbFeatureError, AttributeError):
+            return 0.0, 0.0
+
+    @property
+    def sensor_width(self) -> int:
+        return int(self.cam.SensorWidth.get())
+
+    @property
+    def sensor_height(self) -> int:
+        return int(self.cam.SensorHeight.get())
+
+    @property
+    def pixel_size_um(self) -> float | None:
+        """From the config ("pixel_size_um"); Vimba does not report it."""
+        return self._cfg.get("pixel_size_um")
+
+    @property
+    def aoi(self) -> dict:
+        offset_x, offset_y, width, height = self.get_roi()
+        return dict(offset_x=offset_x, offset_y=offset_y, width=width, height=height)
+
+    def set_aoi(self, offset_px: tuple[int, int], width_px: int, height_px: int):
+        """Readout region (aligned to the camera's increments); the stream is restarted around it."""
+        was_live = self._live
+        self.stop_live()
+        self._crop_camera(offset_px, width_px, height_px)
+        self._camera_metadata["aoi"] = self.aoi
+        if was_live:
+            self.start_live()
+
+    def reset_aoi(self):
+        was_live = self._live
+        self.stop_live()
+        self._uncrop_camera()
+        self._camera_metadata["aoi"] = self.aoi
+        if was_live:
+            self.start_live()
 
     # ---------- Snapshot saving ----------
 

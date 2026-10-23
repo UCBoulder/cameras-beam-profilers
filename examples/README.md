@@ -9,12 +9,16 @@ and a live viewer. Run them from the repo root after `pip install -r requirement
 |---|---|---|---|---|
 | **Cinogy CinCam CMOS 1201** beam profiler, via the Thorlabs uc480 driver *(recommended for the CinCam)* | `cinogy_uc480.CinCamUC480` | Thorlabs uc480 driver: install the free ThorCam software (thorlabs.com). No RayCi. | `snapshot_cincam_uc480.py` | `live_view.py` |
 | Cinogy CinCam CMOS 1201, via the IDS uEye API | `cinogy.CinCamCMOS1201` | CINOGY / RayCi install (`ueye_api_64.dll`), plus `pip install -e ".[ueye]"` | `snapshot_cincam.py` | – |
-| Allied Vision Alvium G1 / Mako G-131B | `allied_vision.AlviumG1` | [Vimba X SDK](https://www.alliedvision.com/en/products/software/vimba-x-sdk/) (see the main README) | `snapshot_alvium.py` | – |
+| Allied Vision Alvium G1 / Mako G-131B | `allied_vision.AlviumG1` | [Vimba X SDK](https://www.alliedvision.com/en/products/software/vimba-x-sdk/) (see the main README) | `snapshot_alvium.py` | `live_view.py alvium` |
 
 The CinCam is an IDS uEye UI-154xLE-M inside (1280 × 1024, 5.2 µm pixels, 8-bit). Both
 CinCam packages talk to the same camera through the same uEye C API; they differ only in
-which vendor driver owns it. The uc480 one needs nothing but the free Thorlabs driver and
-is the only one with a live mode.
+which vendor driver owns it. The uc480 one needs nothing but the free Thorlabs driver.
+
+The live viewer is camera-independent: `python examples/live_view.py cincam` (default) or
+`python examples/live_view.py alvium` for an Allied Vision camera over Vimba X (Alvium,
+Mako over GigE). Any camera class with the small live interface (start_live / stop_live /
+grab_latest, exposure, gain, readout region, snapshot) can be plugged in the same way.
 
 ## CinCam in three steps
 
