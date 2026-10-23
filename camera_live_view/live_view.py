@@ -243,7 +243,6 @@ class LiveView(QtWidgets.QMainWindow):
         self._dead_accum = None     # raw frames being averaged for "Find dead pixels"
         self._raw_last = None       # newest raw frame (before background subtraction)
         self._scan = None           # running PositionScan, see _build_alignment
-        self._scan_next = 0.0
         self._figures = []          # analysis windows kept alive
 
         self._build_toolbar()
@@ -438,10 +437,19 @@ class LiveView(QtWidgets.QMainWindow):
         self.scan_run = QtWidgets.QCheckBox("Run it when the scan is finished")
         self.scan_run.setChecked(True)
         form = QtWidgets.QFormLayout()
+        # the position of the next snapshot: pre-filled from start + n x step, editable at any time
+        self.scan_pos = QtWidgets.QDoubleSpinBox()
+        self.scan_pos.setRange(-1e4, 1e4)
+        self.scan_pos.setDecimals(3)
+        self.scan_pos.setEnabled(False)
+        self.scan_pos.setToolTip("Where the camera is for the next snapshot (input unit). Pre-filled with the last "
+                                 "position + step; type any value for a custom step.")
+        self.scan_pos.valueChanged.connect(lambda _: self._scan_say(self.scan_status.text()))
         form.addRow("Name", self.scan_name)
         form.addRow("Start position", self.scan_start)
         form.addRow("Step", self.scan_step)
         form.addRow("Unit", self.scan_unit)
+        form.addRow("Next snapshot at", self.scan_pos)
         form.addRow("Analysis", self.scan_analysis)
         form_widget = QtWidgets.QWidget()
         form_widget.setLayout(form)
@@ -503,6 +511,7 @@ class LiveView(QtWidgets.QMainWindow):
         self.scan_btn_start.setEnabled(not running)
         for w in (self.scan_name, self.scan_start, self.scan_step, self.scan_unit):
             w.setEnabled(not running)
+        self.scan_pos.setEnabled(running)
         for btn in (self.scan_btn_take, self.scan_btn_finish, self.scan_btn_cancel):
             btn.setEnabled(running)
         self.scan_btn_retake.setEnabled(running and self._scan is not None and len(self._scan) > 0)
@@ -512,15 +521,22 @@ class LiveView(QtWidgets.QMainWindow):
         unit, to_mm = self.scan_unit.currentText(), self.scan_unit.currentData()
         return f"{mm:+.3f} mm" + (f" ({mm / to_mm:+.3f} {unit})" if unit != "mm" else "")
 
+    @property
+    def _scan_next(self) -> float:
+        """Position of the next snapshot in mm (the 'Next snapshot at' field, in the input unit)."""
+        return self.scan_pos.value() * self.scan_unit.currentData()
+
+    def _set_scan_next(self, mm: float):
+        self.scan_pos.blockSignals(True)
+        self.scan_pos.setValue(mm / self.scan_unit.currentData())
+        self.scan_pos.blockSignals(False)
+
     def _scan_say(self, text: str):
         if self._scan is not None:
             self.scan_btn_take.setText(f"Take snapshot at {self._pos(self._scan_next)}")
         self.scan_status.setText(text)
 
     def scan_begin(self):
-        if self.scan_step.value() == 0:
-            QtWidgets.QMessageBox.information(self, "Scan", "The step must not be zero.")
-            return
         to_mm = self.scan_unit.currentData()
         try:
             self._scan = PositionScan.start(self.data_root, self.scan_name.text(), unit="mm",
@@ -530,10 +546,11 @@ class LiveView(QtWidgets.QMainWindow):
         except OSError as err:
             QtWidgets.QMessageBox.critical(self, "Scan", str(err))
             return
-        self._scan_next = self.scan_start.value() * to_mm
         self._scan_buttons(True)
+        self._set_scan_next(self.scan_start.value() * to_mm)
         self._scan_say(f"Scan folder: {self._scan.folder.name}<br>Put the camera at the start position and take "
-                       f"the first snapshot.")
+                       f"the first snapshot. For a custom step, type the actual position in 'Next snapshot at' "
+                       f"before taking it.")
 
     def scan_take(self):
         if self._scan is None:
@@ -542,11 +559,12 @@ class LiveView(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "Scan", "No frame yet: start the live stream.")
             return
         a = self._aoi
-        path = self._scan.add(self._scan_next, self._raw_last, exposure_us=self.cam.exposure_us,
+        taken = self._scan_next
+        path = self._scan.add(taken, self._raw_last, exposure_us=self.cam.exposure_us,
                               gain_db=self.cam.gain_db, aoi=dict(a))
         peak = int(self._raw_last.max())
         step_mm = self._scan.meta["step"]
-        self._scan_next += step_mm
+        self._set_scan_next(taken + step_mm)
         self._scan_buttons(True)
         warn = "<br><span style='color: red'>Saturated: lower the exposure and drop this snapshot.</span>" \
             if peak >= 0.99 * self.cam.max_value else ""
@@ -559,7 +577,7 @@ class LiveView(QtWidgets.QMainWindow):
             return
         entry = self._scan.drop_last()
         if entry is not None:
-            self._scan_next = entry["position"]
+            self._set_scan_next(entry["position"])
         self._scan_buttons(True)
         self._scan_say(f"Dropped {entry['file'] if entry else 'nothing'}. Take the snapshot at "
                        f"{self._pos(self._scan_next)} again.")
