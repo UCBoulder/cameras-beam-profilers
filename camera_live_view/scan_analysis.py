@@ -90,7 +90,7 @@ def waist_vs_position(folder, fig: Figure | None = None) -> Figure:
     x_lo, x_hi = x_lo - pad, x_hi + pad
     fig = fig if fig is not None else Figure(figsize=(8, 5.5))
     ax = fig.add_subplot(111)
-    lines = []
+    lines, curves = [], []
     for axis, colour in (("x", "C0"), ("y", "C3")):
         w = r[f"w{axis}"]
         ax.plot(z, w, "o", color=colour, label=f"w{axis} (1/e² radius along {axis})")
@@ -99,7 +99,8 @@ def waist_vs_position(folder, fig: Figure | None = None) -> Figure:
             zz = np.linspace(x_lo, x_hi, 300)
             err = f" ± {fit['z0_err']:.3f}" if np.isfinite(fit["z0_err"]) else " (3 points: no error estimate)"
             outside = not (z.min() - np.ptp(z) <= fit["z0"] <= z.max() + np.ptp(z))
-            ax.plot(zz, fit["curve"](zz), "-", color=colour, alpha=0.7,
+            curves.append(fit["curve"](zz))
+            ax.plot(zz, curves[-1], "-", color=colour, alpha=0.7,
                     label=f"parabola fit of w{axis}²: focus at {fit['z0']:+.3f}{err} {unit}, "
                           f"w0 = {fit['w0']:.1f} {r['w_unit']}" + ("  — far outside the scan, extend it" if outside else ""))
             ax.axvline(fit["z0"], color=colour, ls=":", alpha=0.7)
@@ -115,9 +116,9 @@ def waist_vs_position(folder, fig: Figure | None = None) -> Figure:
     ax.set_title(title, fontsize=10)
     ax.set_xlabel(f"position ({unit})")
     ax.set_ylabel(f"1/e² radius ({r['w_unit']})")
-    # initial ranges: a few pixels around the measured radii; positions and foci along x
+    # initial ranges: a few pixels around the measured radii and the fitted curves; positions and foci along x
     margin = 5 * r["px"]
-    w_all = np.concatenate([r["wx"], r["wy"]])
+    w_all = np.concatenate([r["wx"], r["wy"]] + curves)
     if len(w_all):
         ax.set_ylim(max(w_all.min() - margin, 0), w_all.max() + margin)
     if len(z) > 1:
