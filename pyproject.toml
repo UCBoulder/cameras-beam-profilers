@@ -20,6 +20,7 @@ live = [               # camera_live_view
     "pyqtgraph>=0.13",
     "PySide6-Essentials>=6.5",
     "scipy>=1.10",     # Gaussian fit
+    "matplotlib>=3.6", # scan analyses (alignment helpers)
 ]
 ueye = [               # cinogy.CinCamCMOS1201 (CinCam through the CINOGY / RayCi driver)
     "pyueye~=4.96",

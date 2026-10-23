@@ -41,6 +41,19 @@ PATH); otherwise set `CINCAM_UC480_DLL` to the full path of `uc480_64.dll`.
   screen. It scrolls when taller than the screen. The window remembers its size, position
   and dock layout between runs; "Reset layout" puts everything back (dock on the left,
   window maximised).
+- Live view "Alignment" dock (tab next to Settings; drag it out for its own window): the
+  **focal plane scan**. Enter a name, the start position and the step (any unit, e.g. mm
+  on a translation stage), start the scan, take a snapshot, move the camera by the step,
+  take the next, … and finish. The raw frames go to `data/alignment_data/<name>_<time>/`
+  as `data_<position><unit>.npy` next to `scan.json`, which lists every position with the
+  exposure, gain and readout region, plus the camera metadata (`camera_live_view.
+  position_scan.PositionScan` reads and writes this format). When the scan is finished
+  the chosen analysis runs in its own window: `camera_live_view.scan_analysis` fits a
+  2D Gaussian to each frame, plots the 1/e² radii along x and y against position, fits a
+  parabola to w² (a Gaussian beam's w(z)² is one) and reports its vertex as the focal
+  plane, per axis and averaged. `examples/analyze_scan.py` runs the same analysis on a
+  saved scan; add your own to `scan_analysis.ANALYSES` (a function `folder -> Figure`)
+  and it appears in the dock's menu.
 - Live view mouse: wheel zooms, right-drag pans, left-drag moves or resizes the yellow
   readout rectangle. The save button stores the raw frame even when background
   subtraction is shown, and records the background file in the metadata.

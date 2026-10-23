@@ -39,6 +39,11 @@ centre, 1/e² radii, ellipticity (minor / major) and major-axis angle are shown 
 sensor, from the top-left pixel or the camera centre, and the ellipse is
 drawn on the image.
 
+"Alignment" dock (tabbed behind the settings; float it into its own window):
+a focal-plane scan takes raw snapshots at positions the user steps through
+by hand (position_scan.py, data/alignment_data/<name>_<stamp>/) and runs
+the chosen analysis (scan_analysis.ANALYSES) when the scan is finished.
+
 Layout after Allied Vision's viewer: toolbar on top (live on/off, save),
 controls in a dock on the left, image in the middle. Mouse wheel zooms,
 right-drag (or left-drag outside the rectangle) pans; the yellow rectangle is
@@ -57,6 +62,8 @@ from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from .gaussian_fit import fit_gaussian_2d
 from .dead_pixels import all_bad_pixels, find_dead_pixels, load_dead_pixels, repair, save_dead_pixels
+from .position_scan import PositionScan, latest_scan
+from .scan_analysis import ANALYSES
 
 # Beam-profiler colour scale, the same as PSFPlotter.BEAM_CMAP: dark blue ->
 # blue -> cyan -> green -> yellow -> red, white only at saturation
@@ -233,9 +240,14 @@ class LiveView(QtWidgets.QMainWindow):
         self._dead = None           # dead pixels and dark spots (dead_pixels.py dict), sensor pixels
         self._dead_path = Path(getattr(cam, "dead_pixel_file", self.data_root / "dead_pixels.json"))
         self._dead_accum = None     # raw frames being averaged for "Find dead pixels"
+        self._raw_last = None       # newest raw frame (before background subtraction)
+        self._scan = None           # running PositionScan, see _build_alignment
+        self._scan_next = 0.0
+        self._figures = []          # analysis windows kept alive
 
         self._build_toolbar()
         self._build_controls()
+        self._build_alignment()
         self._build_image()
         self.status = QtWidgets.QLabel()
         self.statusBar().addPermanentWidget(self.status, 1)
@@ -379,7 +391,7 @@ class LiveView(QtWidgets.QMainWindow):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setMinimumWidth(self.PANEL_MIN_WIDTH)
+        scroll.setMinimumWidth(max(self.PANEL_MIN_WIDTH, panel.minimumSizeHint().width() + 16))  # never clipped
         self.dock = QtWidgets.QDockWidget("Settings", self)
         self.dock.setObjectName("settings")           # needed to save / restore the layout
         self.dock.setWidget(scroll)
@@ -401,6 +413,192 @@ class LiveView(QtWidgets.QMainWindow):
         act_reset.setToolTip("Settings docked on the left, window maximised")
         act_reset.triggered.connect(self.reset_layout)
         self.toolbar.addAction(act_reset)
+
+    def _build_alignment(self):
+        """Alignment helpers dock: the focal-plane scan (snapshots at hand-stepped positions + analysis)."""
+        self.scan_name = QtWidgets.QLineEdit("focus scan")
+        self.scan_start = QtWidgets.QDoubleSpinBox()
+        self.scan_start.setRange(-1e4, 1e4)
+        self.scan_start.setDecimals(3)
+        self.scan_step = QtWidgets.QDoubleSpinBox()
+        self.scan_step.setRange(-1e3, 1e3)
+        self.scan_step.setDecimals(3)
+        self.scan_step.setValue(0.5)
+        self.scan_unit = QtWidgets.QLineEdit("mm")
+        self.scan_unit.setMaximumWidth(50)
+        self.scan_analysis = QtWidgets.QComboBox()
+        self.scan_analysis.addItems(list(ANALYSES))
+        self.scan_analysis.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.scan_analysis.setMinimumContentsLength(12)
+        self.scan_analysis.setToolTip("\n".join(ANALYSES))
+        self.scan_run = QtWidgets.QCheckBox("Run it when the scan is finished")
+        self.scan_run.setChecked(True)
+        form = QtWidgets.QFormLayout()
+        form.addRow("Name", self.scan_name)
+        form.addRow("Start position", self.scan_start)
+        form.addRow("Step", self.scan_step)
+        form.addRow("Unit", self.scan_unit)
+        form.addRow("Analysis", self.scan_analysis)
+        form_widget = QtWidgets.QWidget()
+        form_widget.setLayout(form)
+
+        self.scan_status = QtWidgets.QLabel("No scan running.")
+        self.scan_status.setWordWrap(True)
+        self.scan_btn_start = QtWidgets.QPushButton("Start scan")
+        self.scan_btn_start.clicked.connect(self.scan_begin)
+        self.scan_btn_take = QtWidgets.QPushButton("Take snapshot")
+        self.scan_btn_take.clicked.connect(self.scan_take)
+        self.scan_btn_retake = QtWidgets.QPushButton("Drop last snapshot")
+        self.scan_btn_retake.clicked.connect(self.scan_drop_last)
+        self.scan_btn_finish = QtWidgets.QPushButton("Finish scan")
+        self.scan_btn_finish.clicked.connect(self.scan_finish)
+        self.scan_btn_cancel = QtWidgets.QPushButton("Cancel scan")
+        self.scan_btn_cancel.clicked.connect(self.scan_cancel)
+        analyse = QtWidgets.QPushButton("Analyse a saved scan…")
+        analyse.clicked.connect(self.scan_analyse_folder)
+        for btn in (self.scan_btn_take, self.scan_btn_retake, self.scan_btn_finish, self.scan_btn_cancel):
+            btn.setEnabled(False)
+
+        help_text = QtWidgets.QLabel(
+            "Find the focal plane of a lens: put the camera at the start position, start the scan, take a "
+            "snapshot, move the camera by the step, take the next, … and finish. Raw frames go to "
+            "data/alignment_data/&lt;name&gt;_&lt;time&gt;/ as data_&lt;position&gt;.npy with scan.json listing "
+            "every position; the analysis fits a Gaussian to each and a parabola to w² against position.")
+        help_text.setWordWrap(True)
+        help_text.setStyleSheet("color: gray")
+
+        panel = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(panel)
+        layout.addWidget(self._group("Focal plane scan", help_text, form_widget, self.scan_run, self.scan_status,
+                                     self.scan_btn_start, self.scan_btn_take, self.scan_btn_retake,
+                                     self.scan_btn_finish, self.scan_btn_cancel, analyse))
+        layout.addStretch(1)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidget(panel)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setMinimumWidth(max(self.PANEL_MIN_WIDTH, panel.minimumSizeHint().width() + 16))  # never clipped
+        self.align_dock = QtWidgets.QDockWidget("Alignment", self)
+        self.align_dock.setObjectName("alignment")
+        self.align_dock.setWidget(scroll)
+        self.align_dock.setFeatures(self.dock.features())
+        self.align_dock.setAllowedAreas(self.dock.allowedAreas())
+        self.addDockWidget(QtCore.Qt.DockWidgetArea.LeftDockWidgetArea, self.align_dock)
+        self.tabifyDockWidget(self.dock, self.align_dock)   # tabs with the settings; drag it out for its own window
+        self.dock.raise_()
+        act = self.align_dock.toggleViewAction()
+        act.setText("Alignment")
+        act.setToolTip("Show / hide the alignment helpers (drag the title bar out for a separate window)")
+        self.toolbar.insertAction(self.toolbar.actions()[-1], act)
+
+    # ---------- focal plane scan ----------
+
+    def _scan_buttons(self, running: bool):
+        self.scan_btn_start.setEnabled(not running)
+        for w in (self.scan_name, self.scan_start, self.scan_step, self.scan_unit):
+            w.setEnabled(not running)
+        for btn in (self.scan_btn_take, self.scan_btn_finish, self.scan_btn_cancel):
+            btn.setEnabled(running)
+        self.scan_btn_retake.setEnabled(running and self._scan is not None and len(self._scan) > 0)
+
+    def _scan_say(self, text: str):
+        unit = self.scan_unit.text().strip()
+        if self._scan is not None:
+            self.scan_btn_take.setText(f"Take snapshot at {self._scan_next:+.3f} {unit}")
+        self.scan_status.setText(text)
+
+    def scan_begin(self):
+        if self.scan_step.value() == 0:
+            QtWidgets.QMessageBox.information(self, "Scan", "The step must not be zero.")
+            return
+        try:
+            self._scan = PositionScan.start(self.data_root, self.scan_name.text(), unit=self.scan_unit.text().strip(),
+                                            start=self.scan_start.value(), step=self.scan_step.value(),
+                                            camera=self.cam)
+        except OSError as err:
+            QtWidgets.QMessageBox.critical(self, "Scan", str(err))
+            return
+        self._scan_next = self.scan_start.value()
+        self._scan_buttons(True)
+        self._scan_say(f"Scan folder: {self._scan.folder.name}<br>Put the camera at the start position and take "
+                       f"the first snapshot.")
+
+    def scan_take(self):
+        if self._scan is None:
+            return
+        if self._raw_last is None:
+            QtWidgets.QMessageBox.information(self, "Scan", "No frame yet: start the live stream.")
+            return
+        a = self._aoi
+        path = self._scan.add(self._scan_next, self._raw_last, exposure_us=self.cam.exposure_us,
+                              gain_db=self.cam.gain_db, aoi=dict(a))
+        peak = int(self._raw_last.max())
+        taken = self._scan_next
+        self._scan_next += self.scan_step.value()
+        self._scan_buttons(True)
+        warn = "<br><span style='color: red'>Saturated: lower the exposure and drop this snapshot.</span>" \
+            if peak >= 0.99 * self.cam.max_value else ""
+        self._scan_say(f"Snapshot {len(self._scan)} saved: {path.name} (peak {peak}).{warn}<br>"
+                       f"Move the camera by <b>{self.scan_step.value():+.3f} {self._scan.unit}</b> to "
+                       f"<b>{self._scan_next:+.3f} {self._scan.unit}</b>, then take the next, or finish.")
+
+    def scan_drop_last(self):
+        if self._scan is None:
+            return
+        entry = self._scan.drop_last()
+        if entry is not None:
+            self._scan_next = entry["position"]
+        self._scan_buttons(True)
+        self._scan_say(f"Dropped {entry['file'] if entry else 'nothing'}. Take the snapshot at "
+                       f"{self._scan_next:+.3f} {self._scan.unit} again.")
+
+    def scan_finish(self):
+        if self._scan is None:
+            return
+        scan, self._scan = self._scan, None
+        folder = scan.finish()
+        self._scan_buttons(False)
+        self.scan_btn_take.setText("Take snapshot")
+        self.scan_status.setText(f"Finished: {len(scan)} snapshots in {folder}")
+        if self.scan_run.isChecked() and len(scan):
+            self.scan_analyse(folder)
+
+    def scan_cancel(self):
+        if self._scan is None:
+            return
+        scan, self._scan = self._scan, None
+        self._scan_buttons(False)
+        self.scan_btn_take.setText("Take snapshot")
+        self.scan_status.setText(f"Cancelled; the {len(scan)} snapshots stay in {scan.folder.name}.")
+
+    def scan_analyse_folder(self):
+        start = latest_scan(self.data_root) or (self.data_root / "alignment_data")
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Scan folder (contains scan.json)", str(start))
+        if folder:
+            self.scan_analyse(Path(folder))
+
+    def scan_analyse(self, folder: Path):
+        name = self.scan_analysis.currentText()
+        try:
+            fig = ANALYSES[name](folder)
+        except Exception as err:   # a bad scan must not take the viewer down
+            QtWidgets.QMessageBox.critical(self, name, f"{type(err).__name__}: {err}")
+            return
+        self.show_figure(fig, f"{name} — {Path(folder).name}")
+
+    def show_figure(self, fig, title: str):
+        """A matplotlib figure in its own (non-blocking) window with the usual toolbar."""
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
+        window = QtWidgets.QMainWindow(self)
+        window.setWindowTitle(title)
+        canvas = FigureCanvasQTAgg(fig)
+        window.setCentralWidget(canvas)
+        window.addToolBar(NavigationToolbar2QT(canvas, window))
+        window.resize(900, 620)
+        window.show()
+        self._figures.append(window)
+        return window
 
     def _build_image(self):
         W, H = self.cam.sensor_width, self.cam.sensor_height
@@ -637,6 +835,7 @@ class LiveView(QtWidgets.QMainWindow):
         frame = self.cam.grab_latest()
         if frame is None:
             return
+        self._raw_last = frame
         if self._dead_accum is not None:
             self._accumulate_dead(frame)
         if self.subtract.isChecked() and self._bg_slice is not None and self._bg_slice.shape == frame.shape:
