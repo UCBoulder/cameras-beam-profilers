@@ -216,6 +216,7 @@ class LiveView(QtWidgets.QMainWindow):
 
     POLL_MS = 30       # grab_latest() polling period
     PANEL_MIN_WIDTH = 270   # settings column (px); drag the separator to widen it
+    SCAN_UNITS = {"mm": 1.0, "inch": 25.4, "µm": 1e-3}   # input units of the focal-plane scan -> mm
     STATUS_S = 0.5     # status-bar refresh
     FIT_PER_SECOND = 10.0   # at most; a fit slower than the interval just delays the next one
     DEAD_PIXEL_FRAMES = 8   # frames averaged by "Find dead pixels"
@@ -424,8 +425,11 @@ class LiveView(QtWidgets.QMainWindow):
         self.scan_step.setRange(-1e3, 1e3)
         self.scan_step.setDecimals(3)
         self.scan_step.setValue(0.5)
-        self.scan_unit = QtWidgets.QLineEdit("mm")
-        self.scan_unit.setMaximumWidth(50)
+        self.scan_unit = QtWidgets.QComboBox()       # input unit only: positions are stored and analysed in mm
+        for unit, to_mm in self.SCAN_UNITS.items():
+            self.scan_unit.addItem(unit, to_mm)
+        self.scan_unit.setMaximumWidth(90)
+        self.scan_unit.setToolTip("Unit of the start position and the step you type; everything is saved in mm")
         self.scan_analysis = QtWidgets.QComboBox()
         self.scan_analysis.addItems(list(ANALYSES))
         self.scan_analysis.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
@@ -461,7 +465,8 @@ class LiveView(QtWidgets.QMainWindow):
 
         help_text = QtWidgets.QLabel(
             "Find the focal plane of a lens: put the camera at the start position, start the scan, take a "
-            "snapshot, move the camera by the step, take the next, … and finish. Raw frames go to "
+            "snapshot, move the camera by the step, take the next, … and finish. Positions are saved in mm "
+            "whatever unit you type in. Raw frames go to "
             "data/alignment_data/&lt;name&gt;_&lt;time&gt;/ as data_&lt;position&gt;.npy with scan.json listing "
             "every position; the analysis fits a Gaussian to each and a parabola to w² against position.")
         help_text.setWordWrap(True)
@@ -502,24 +507,30 @@ class LiveView(QtWidgets.QMainWindow):
             btn.setEnabled(running)
         self.scan_btn_retake.setEnabled(running and self._scan is not None and len(self._scan) > 0)
 
+    def _pos(self, mm: float) -> str:
+        """A position in mm, with the value in the input unit when that is not mm: '+12.700 mm (+0.500 inch)'."""
+        unit, to_mm = self.scan_unit.currentText(), self.scan_unit.currentData()
+        return f"{mm:+.3f} mm" + (f" ({mm / to_mm:+.3f} {unit})" if unit != "mm" else "")
+
     def _scan_say(self, text: str):
-        unit = self.scan_unit.text().strip()
         if self._scan is not None:
-            self.scan_btn_take.setText(f"Take snapshot at {self._scan_next:+.3f} {unit}")
+            self.scan_btn_take.setText(f"Take snapshot at {self._pos(self._scan_next)}")
         self.scan_status.setText(text)
 
     def scan_begin(self):
         if self.scan_step.value() == 0:
             QtWidgets.QMessageBox.information(self, "Scan", "The step must not be zero.")
             return
+        to_mm = self.scan_unit.currentData()
         try:
-            self._scan = PositionScan.start(self.data_root, self.scan_name.text(), unit=self.scan_unit.text().strip(),
-                                            start=self.scan_start.value(), step=self.scan_step.value(),
-                                            camera=self.cam)
+            self._scan = PositionScan.start(self.data_root, self.scan_name.text(), unit="mm",
+                                            start=self.scan_start.value() * to_mm, step=self.scan_step.value() * to_mm,
+                                            camera=self.cam, input_unit=self.scan_unit.currentText(),
+                                            input_start=self.scan_start.value(), input_step=self.scan_step.value())
         except OSError as err:
             QtWidgets.QMessageBox.critical(self, "Scan", str(err))
             return
-        self._scan_next = self.scan_start.value()
+        self._scan_next = self.scan_start.value() * to_mm
         self._scan_buttons(True)
         self._scan_say(f"Scan folder: {self._scan.folder.name}<br>Put the camera at the start position and take "
                        f"the first snapshot.")
@@ -534,14 +545,14 @@ class LiveView(QtWidgets.QMainWindow):
         path = self._scan.add(self._scan_next, self._raw_last, exposure_us=self.cam.exposure_us,
                               gain_db=self.cam.gain_db, aoi=dict(a))
         peak = int(self._raw_last.max())
-        taken = self._scan_next
-        self._scan_next += self.scan_step.value()
+        step_mm = self._scan.meta["step"]
+        self._scan_next += step_mm
         self._scan_buttons(True)
         warn = "<br><span style='color: red'>Saturated: lower the exposure and drop this snapshot.</span>" \
             if peak >= 0.99 * self.cam.max_value else ""
         self._scan_say(f"Snapshot {len(self._scan)} saved: {path.name} (peak {peak}).{warn}<br>"
-                       f"Move the camera by <b>{self.scan_step.value():+.3f} {self._scan.unit}</b> to "
-                       f"<b>{self._scan_next:+.3f} {self._scan.unit}</b>, then take the next, or finish.")
+                       f"Move the camera by <b>{self._pos(step_mm)}</b> to <b>{self._pos(self._scan_next)}</b>, "
+                       f"then take the next, or finish.")
 
     def scan_drop_last(self):
         if self._scan is None:
@@ -551,7 +562,7 @@ class LiveView(QtWidgets.QMainWindow):
             self._scan_next = entry["position"]
         self._scan_buttons(True)
         self._scan_say(f"Dropped {entry['file'] if entry else 'nothing'}. Take the snapshot at "
-                       f"{self._scan_next:+.3f} {self._scan.unit} again.")
+                       f"{self._pos(self._scan_next)} again.")
 
     def scan_finish(self):
         if self._scan is None:

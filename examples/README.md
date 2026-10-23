@@ -42,8 +42,9 @@ PATH); otherwise set `CINCAM_UC480_DLL` to the full path of `uc480_64.dll`.
   and dock layout between runs; "Reset layout" puts everything back (dock on the left,
   window maximised).
 - Live view "Alignment" dock (tab next to Settings; drag it out for its own window): the
-  **focal plane scan**. Enter a name, the start position and the step (any unit, e.g. mm
-  on a translation stage), start the scan, take a snapshot, move the camera by the step,
+  **focal plane scan**. Enter a name, the start position and the step (typed in mm, inch
+  or µm; positions are stored and analysed in mm), start the scan, take a snapshot, move
+  the camera by the step,
   take the next, … and finish. The raw frames go to `data/alignment_data/<name>_<time>/`
   as `data_<position><unit>.npy` next to `scan.json`, which lists every position with the
   exposure, gain and readout region, plus the camera metadata (`camera_live_view.

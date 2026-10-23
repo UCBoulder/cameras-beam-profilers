@@ -39,21 +39,26 @@ class PositionScan:
 
     @classmethod
     def start(cls, root: str | Path, name: str, unit: str = "mm", start: float = 0.0, step: float = 1.0,
-              camera=None) -> "PositionScan":
-        """Create <root>/alignment_data/<name>_<stamp>/ and its index."""
+              camera=None, **info) -> "PositionScan":
+        """Create <root>/alignment_data/<name>_<stamp>/ and its index (`info` is stored in it as is)."""
         stamp = datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
         slug = re.sub(r"[^\w-]+", "_", name.strip()) or "scan"
         folder = Path(root) / "alignment_data" / f"{slug}_{stamp}"
+        for n in range(2, 100):                      # two scans started within the same second
+            if not folder.exists():
+                break
+            folder = folder.with_name(f"{slug}_{stamp}_{n}")
         folder.mkdir(parents=True, exist_ok=False)
         meta = dict(name=name, created=datetime.now().isoformat(timespec="seconds"), unit=unit,
-                    start=float(start), step=float(step), finished=None,
+                    start=float(start), step=float(step), finished=None, **info,
                     camera=_camera_info(camera), snapshots=[])
         scan = cls(folder, meta)
         scan._write()
         return scan
 
     def filename(self, position: float) -> str:
-        return f"data_{position:+.3f}{self.meta['unit']}.npy"
+        unit = re.sub(r"[^\w]+", "", self.meta["unit"])     # file-name safe ("inch", "mm", "µm", "steps")
+        return f"data_{position:+.3f}{unit}.npy"
 
     def add(self, position: float, frame: np.ndarray, **info) -> Path:
         """Save `frame` for `position` (a repeated position replaces the earlier shot) and update the index."""
