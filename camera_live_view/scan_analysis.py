@@ -83,6 +83,11 @@ def waist_vs_position(folder, fig: Figure | None = None) -> Figure:
     r = fit_scan(folder)
     z, unit = r["positions"], r["unit"]
     fits = {axis: parabola_focus(z, r[f"w{axis}"]) for axis in ("x", "y")}
+    # x window: the scanned positions and the fitted foci (when not absurdly far), plus 5 %
+    foci = [f["z0"] for f in fits.values() if f is not None and z.min() - np.ptp(z) <= f["z0"] <= z.max() + np.ptp(z)]
+    x_lo, x_hi = min([z.min()] + foci), max([z.max()] + foci)
+    pad = 0.05 * max(x_hi - x_lo, 1e-9)
+    x_lo, x_hi = x_lo - pad, x_hi + pad
     fig = fig if fig is not None else Figure(figsize=(8, 5.5))
     ax = fig.add_subplot(111)
     lines = []
@@ -91,7 +96,7 @@ def waist_vs_position(folder, fig: Figure | None = None) -> Figure:
         ax.plot(z, w, "o", color=colour, label=f"w{axis} (1/e² radius along {axis})")
         fit = fits[axis]
         if fit is not None:
-            zz = np.linspace(z.min() - 0.1 * np.ptp(z), z.max() + 0.1 * np.ptp(z), 300)
+            zz = np.linspace(x_lo, x_hi, 300)
             err = f" ± {fit['z0_err']:.3f}" if np.isfinite(fit["z0_err"]) else " (3 points: no error estimate)"
             outside = not (z.min() - np.ptp(z) <= fit["z0"] <= z.max() + np.ptp(z))
             ax.plot(zz, fit["curve"](zz), "-", color=colour, alpha=0.7,
@@ -110,13 +115,13 @@ def waist_vs_position(folder, fig: Figure | None = None) -> Figure:
     ax.set_title(title, fontsize=10)
     ax.set_xlabel(f"position ({unit})")
     ax.set_ylabel(f"1/e² radius ({r['w_unit']})")
-    # initial ranges: the measured radii ± 20 px, the scanned positions ± 10 %
-    margin = 20 * r["px"]
+    # initial ranges: a few pixels around the measured radii; positions and foci along x
+    margin = 5 * r["px"]
     w_all = np.concatenate([r["wx"], r["wy"]])
     if len(w_all):
         ax.set_ylim(max(w_all.min() - margin, 0), w_all.max() + margin)
     if len(z) > 1:
-        ax.set_xlim(z.min() - 0.1 * np.ptp(z), z.max() + 0.1 * np.ptp(z))
+        ax.set_xlim(x_lo, x_hi)
     ax.grid(alpha=0.3)
     ax.legend(fontsize=8)
     fig.tight_layout()
