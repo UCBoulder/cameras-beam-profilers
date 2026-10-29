@@ -75,10 +75,14 @@ PATH); otherwise set `CINCAM_UC480_DLL` to the full path of `uc480_64.dll`.
   sensor (±1000 px): large windows are binned so that a fit stays at 10–20 ms, and a
   small spot inside a large window is automatically refitted unbinned. Set the window
   larger than the beam; a window smaller than the beam gives meaningless widths.
-  "Mark centre" puts a magenta cross at the most recent Gaussian centre and lists its
-  coordinates in the image legend under the name you give it (e.g. "optical axis"): a
-  position marker for realigning optics. Click again to move it, "Remove mark" to clear it;
-  it is remembered between runs.
+  The fit window is a drop-down of presets (±10 to ±500 px around the brightest spot) or
+  "full frame" for a beam larger than the sensor; its centre may then lie off the chip and
+  is flagged as extrapolated. Any half-size can be typed. Under the current fit the readout
+  shows the plain mean and standard deviation of the last N fitted centres (default 10).
+  "Mark current" / "Mark average" put a magenta cross at the latest or the averaged centre
+  and list its coordinates in the image legend under the name you give it (e.g. "optical
+  axis"): a position marker for realigning optics. Click again to move it, "Remove mark" to
+  clear it; it is remembered between runs.
 - Dead pixels and dark spots (same group): light the whole sensor with a clean, broad
   beam, read out the full sensor and press "Find dead pixels". Eight frames are averaged
   and two kinds of bad pixels are mapped. A *dead pixel* is a single pixel at least 30 %

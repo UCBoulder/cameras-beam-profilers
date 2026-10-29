@@ -47,8 +47,12 @@ def find_spot(img: np.ndarray, block: int = 4) -> tuple[int, int]:
 
 
 def fit_window(img: np.ndarray, ix: int, iy: int, half_size: int, max_pixels: int = MAX_PIXELS,
-               max_nfev: int = 100) -> dict:
-    """Fit gaussian_2d() to the (binned) window of ±half_size around pixel (ix, iy)."""
+               max_nfev: int = 100, centre_margin: float = 0.0) -> dict:
+    """
+    Fit gaussian_2d() to the (binned) window of ±half_size around pixel (ix, iy).
+    The centre may lie up to centre_margin × the window size outside the window
+    (for a beam larger than the sensor whose centre is off the chip).
+    """
     h_img, w_img = img.shape
     x_min, x_max = max(ix - half_size, 0), min(ix + half_size + 1, w_img)
     y_min, y_max = max(iy - half_size, 0), min(iy + half_size + 1, h_img)
@@ -78,32 +82,57 @@ def fit_window(img: np.ndarray, ix: int, iy: int, half_size: int, max_pixels: in
         return dict(x0=cx, y0=cy, wx=w0, wy=w0, theta=0.0, amplitude=amplitude0, offset=offset0,
                     peak=amplitude0 + offset0, window=(x_min, y_min, x_max, y_max), binning=b)
     p0 = (amplitude0, cx, cy, w0, w0, 0.0, offset0)
-    lower = (0.0, x_min, y_min, 0.3 * b, 0.3 * b, -np.pi / 2, -np.inf)
-    upper = (np.inf, x_max, y_max, 4.0 * half_size, 4.0 * half_size, np.pi / 2, np.inf)
+    mx, my = centre_margin * (x_max - x_min), centre_margin * (y_max - y_min)
+    lower = (0.0, x_min - mx, y_min - my, 0.3 * b, 0.3 * b, -np.pi / 2, -np.inf)
+    upper = (np.inf, x_max + mx, y_max + my, 4.0 * half_size, 4.0 * half_size, np.pi / 2, np.inf)
     popt, _ = curve_fit(gaussian_2d, (xx.ravel(), yy.ravel()), window.ravel(), p0=p0,
                         bounds=(lower, upper), max_nfev=max_nfev, x_scale="jac")
     A, x0, y0, wx, wy, theta, B = (float(v) for v in popt)
+    # noise of the fitted window: robust scatter of the residuals (used to reject fits to pure noise)
+    resid = window.ravel() - gaussian_2d((xx.ravel(), yy.ravel()), *popt)
+    noise = 1.4826 * float(np.median(np.abs(resid - np.median(resid))))
     return dict(x0=x0, y0=y0, wx=wx, wy=wy, theta=theta, amplitude=A, offset=B, peak=A + B,
-                window=(int(x_min), int(y_min), int(x_max), int(y_max)), binning=b)
+                window=(int(x_min), int(y_min), int(x_max), int(y_max)), binning=b, noise=noise)
 
 
-def fit_gaussian_2d(frame: np.ndarray, half_size: int = 30, max_pixels: int = MAX_PIXELS) -> dict:
+def _significant(fit: dict) -> bool:
+    """Fitted amplitude at least 5 noise sigma (and 2.5 counts) above the offset."""
+    return fit["amplitude"] >= 5.0 * max(fit.get("noise", 0.0), 0.5)
+
+
+def fit_gaussian_2d(frame: np.ndarray, half_size: int | None = 30, max_pixels: int = MAX_PIXELS) -> dict:
     """
-    Fit gaussian_2d() to the spot around the brightest pixel of `frame`.
+    Fit gaussian_2d() to the spot around the brightest pixel of `frame`, in a
+    window of ±half_size pixels, or the whole frame with half_size=None. In the
+    whole-frame case the centre may lie outside the frame (a beam larger than
+    the sensor, centred off the chip); fit["outside"] says so.
 
     Returns a dict with x0, y0, wx, wy, theta, amplitude, offset, peak (A + B),
-    window (x_min, y_min, x_max, y_max) and binning (b, 1 = unbinned); raises
-    RuntimeError if the fit does not converge.
+    window (x_min, y_min, x_max, y_max), binning (b, 1 = unbinned) and outside;
+    raises RuntimeError if the fit does not converge or finds no spot standing
+    clearly above the noise (a blocked beam: a free Gaussian would otherwise
+    "fit" the noise).
     """
     img = np.asarray(frame, dtype=float)
     iy, ix = find_spot(img)
-    half = half_size
-    for _ in range(4):
-        fit = fit_window(img, ix, iy, half, max_pixels)
+    full = half_size is None
+    half = max(img.shape) if full else half_size
+    for attempt in range(4):
+        fit = fit_window(img, ix, iy, half, max_pixels, centre_margin=1.0 if full and attempt == 0 else 0.0)
+        if fit["binning"] > 1 and not _significant(fit):
+            # binning averaged a small spot away: look again, unbinned, around the brightest pixel
+            iy, ix = find_spot(img)
+            half = max(int(np.sqrt(max_pixels) / 2) - 1, 5)
+            continue
         w_max = max(fit["wx"], fit["wy"])
         if fit["binning"] == 1 or w_max >= 4 * fit["binning"]:
             break
         # small spot in a big window: refit around it with a window matched to its size
         half = max(int(np.ceil(4 * w_max)), 5)
         ix, iy = int(round(fit["x0"])), int(round(fit["y0"]))
+    if not _significant(fit):
+        raise RuntimeError(f"no significant spot (fitted peak {fit['amplitude']:.1f} counts above the offset, "
+                           f"noise {fit.get('noise', float('nan')):.1f})")
+    h, w = img.shape
+    fit["outside"] = not (-0.5 <= fit["x0"] <= w - 0.5 and -0.5 <= fit["y0"] <= h - 0.5)
     return fit

@@ -52,7 +52,9 @@ the camera's readout region (drag / resize it, then "Apply to camera").
 
 import json
 import math
+import re
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -218,6 +220,7 @@ class LiveView(QtWidgets.QMainWindow):
     PANEL_MIN_WIDTH = 270   # settings column (px); drag the separator to widen it
     SCAN_UNITS = {"mm": 1.0, "inch": 25.4, "µm": 1e-3}   # input units of the focal-plane scan -> mm
     STATUS_S = 0.5     # status-bar refresh
+    FIT_WINDOWS = (10, 20, 30, 50, 100, 200, 500)   # preset fit half-sizes (px); plus "full frame"
     FIT_PER_SECOND = 10.0   # at most; a fit slower than the interval just delays the next one
     DEAD_PIXEL_FRAMES = 8   # frames averaged by "Find dead pixels"
 
@@ -333,7 +336,7 @@ class LiveView(QtWidgets.QMainWindow):
 
         # Gaussian fit: on / off, units and origin of the readout, window around the spot
         self.fit_on = QtWidgets.QCheckBox(f"Fit a 2D Gaussian ({self.FIT_PER_SECOND:g} / s)")
-        self.fit_on.toggled.connect(self._show_fit)
+        self.fit_on.toggled.connect(lambda _: (self._fit_history.clear(), self._show_fit()))
         self.fit_units = QtWidgets.QComboBox()
         self.fit_units.addItem("pixels", 1.0)
         pixel_um = getattr(self.cam, "pixel_size_um", None)
@@ -341,10 +344,24 @@ class LiveView(QtWidgets.QMainWindow):
             self.fit_units.addItem("µm on the sensor", float(pixel_um))
         self.fit_origin = QtWidgets.QComboBox()
         self.fit_origin.addItems(["top-left pixel", "camera centre"])
-        self.fit_window = QtWidgets.QSpinBox()
-        self.fit_window.setRange(5, 1000)
-        self.fit_window.setValue(30)
-        self.fit_window.setSuffix(" px")
+        # fit window: presets (± px around the brightest spot) or the whole readout; any number can be typed
+        self.fit_window = QtWidgets.QComboBox()
+        self.fit_window.setEditable(True)
+        self.fit_window.addItems([f"±{n} px" for n in self.FIT_WINDOWS] + ["full frame"])
+        self.fit_window.setCurrentText("±30 px")
+        self.fit_window.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
+        self.fit_window.setToolTip("Region fitted around the brightest spot. 'full frame' fits the whole readout "
+                                   "(a beam larger than the sensor; its centre may then lie off the chip). "
+                                   "Type any half-size in px.")
+        self._fit_half = 30
+        self.fit_window.currentTextChanged.connect(self._fit_window_changed)
+        self.fit_avg_n = QtWidgets.QSpinBox()
+        self.fit_avg_n.setRange(2, 200)
+        self.fit_avg_n.setValue(10)
+        self.fit_avg_n.setSuffix(" fits")
+        self.fit_avg_n.setToolTip("Running average (and standard deviation) of the last N fits")
+        self._fit_history = deque(maxlen=10)
+        self.fit_avg_n.valueChanged.connect(lambda n: setattr(self, "_fit_history", deque(self._fit_history, maxlen=n)))
         self.fit_ellipse = QtWidgets.QCheckBox("Show 1/e² ellipse and axes")
         self.fit_ellipse.setChecked(True)
         for w in (self.fit_units, self.fit_origin):
@@ -354,7 +371,8 @@ class LiveView(QtWidgets.QMainWindow):
         fit_form = QtWidgets.QFormLayout()
         fit_form.addRow("Units", self.fit_units)
         fit_form.addRow("(0, 0) at", self.fit_origin)
-        fit_form.addRow("Fit window ±", self.fit_window)
+        fit_form.addRow("Fit window", self.fit_window)
+        fit_form.addRow("Average over", self.fit_avg_n)
         fit_widget = QtWidgets.QWidget()
         fit_widget.setLayout(fit_form)
 
@@ -375,17 +393,21 @@ class LiveView(QtWidgets.QMainWindow):
         self.mark_name = QtWidgets.QLineEdit("marked centre")
         self.mark_name.setToolTip("Legend name of the marker, e.g. 'optical axis'")
         self.mark_name.textChanged.connect(lambda _: self._show_mark())
-        mark_btn = QtWidgets.QPushButton("Mark centre")
+        mark_btn = QtWidgets.QPushButton("Mark current")
         mark_btn.setToolTip("Put a cross at the most recent Gaussian centre (click again to move it there)")
-        mark_btn.clicked.connect(lambda: self.mark_centre())
+        mark_btn.clicked.connect(lambda: self.mark_centre("current"))
+        mark_avg_btn = QtWidgets.QPushButton("Mark average")
+        mark_avg_btn.setToolTip("Put a cross at the running-average centre of the last N fits")
+        mark_avg_btn.clicked.connect(lambda: self.mark_centre("average"))
         unmark_btn = QtWidgets.QPushButton("Remove mark")
         unmark_btn.clicked.connect(lambda: self.remove_mark())
         mark_row = QtWidgets.QHBoxLayout()
         mark_row.addWidget(mark_btn)
-        mark_row.addWidget(unmark_btn)
+        mark_row.addWidget(mark_avg_btn)
         mark_form = QtWidgets.QFormLayout()
         mark_form.addRow("Marker", self.mark_name)
         mark_form.addRow(mark_row)
+        mark_form.addRow(unmark_btn)
         mark_widget = QtWidgets.QWidget()
         mark_widget.setLayout(mark_form)
 
@@ -713,10 +735,18 @@ class LiveView(QtWidgets.QMainWindow):
         self.mark_item.setZValue(13)
         self.plot.addItem(self.mark_item)
         store = QtCore.QSettings(*self._settings)
-        self._mark = store.value("mark", None)       # (x0, y0) in sensor pixels, remembered between runs
+        try:
+            self._mark = store.value("mark", None)   # (x0, y0) in sensor pixels, remembered between runs
+            self._mark = None if self._mark is None else tuple(float(v) for v in self._mark)
+        except (RuntimeError, TypeError, ValueError):  # unreadable entry: start without a mark
+            self._mark = None
+        self._mark_note = ""
         if self._mark is not None:
-            self._mark = tuple(float(v) for v in self._mark)
             self.mark_name.setText(store.value("mark_name", "marked centre"))
+            self._mark_note = str(store.value("mark_note", "") or "")
+        window = store.value("fit_window", None)
+        if window:
+            self.fit_window.setCurrentText(str(window))
         self._show_mark()
         self._mouse_pos = None
         self.plot.scene().sigMouseMoved.connect(self._mouse_moved)
@@ -757,6 +787,7 @@ class LiveView(QtWidgets.QMainWindow):
             self._aoi = self.cam.aoi
             self._set_roi(**self._aoi)            # the camera may have aligned it
             self._update_background_slice()
+            self._fit_history.clear()
             self.plot.setRange(self._aoi_rect(), padding=0.05)
 
     def _full_frame(self):
@@ -764,6 +795,7 @@ class LiveView(QtWidgets.QMainWindow):
             self._aoi = self.cam.aoi
             self._set_roi(**self._aoi)
             self._update_background_slice()
+            self._fit_history.clear()
             self.plot.autoRange()
 
     # ---------- Background ----------
@@ -927,7 +959,7 @@ class LiveView(QtWidgets.QMainWindow):
         if self.dead_ignore.isChecked() and self._dead is not None:
             frame = repair(frame, self._dead, offset=(self._aoi["offset_y"], self._aoi["offset_x"]))
         try:
-            fit = fit_gaussian_2d(frame, self.fit_window.value())
+            fit = fit_gaussian_2d(frame, self._fit_half)
         except RuntimeError as err:
             self._fit = dict(error=str(err))
         else:
@@ -935,6 +967,7 @@ class LiveView(QtWidgets.QMainWindow):
             fit["y0"] += self._aoi["offset_y"]
             fit["ms"] = 1e3 * (time.perf_counter() - now)
             self._fit = fit
+            self._fit_history.append((fit["x0"], fit["y0"]))   # log of the fitted centres (sensor pixels)
         self._fit_time = time.perf_counter()   # interval counted from the end of the fit
         self._show_fit()
 
@@ -957,7 +990,13 @@ class LiveView(QtWidgets.QMainWindow):
             f"<b>ellipticity {w_minor / w_major:.3f}</b>, major axis at {major_deg:.0f}°"
             f"&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;fitted peak {fit['peak']:.0f} counts"
             f"&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;{fit['ms']:.0f} ms"
-            + (f" (binned {fit['binning']}×)" if fit["binning"] > 1 else ""))
+            + (f" (binned {fit['binning']}×)" if fit["binning"] > 1 else "")
+            + ("<br><span style='color: #c00000'>centre outside the readout: extrapolated from the visible part "
+               "of the beam</span>" if fit.get("outside") else "")
+            + ("<br><span style='color: #c00000'>beam wider than the fit window: the radii are not measured, "
+               "choose a larger window or full frame</span>"
+               if self._fit_half is not None and w_major > self._fit_half else "")
+            + self._average_text(scale, unit))
         if not self.fit_ellipse.isChecked():
             self.fit_curve.setData([], [])
             return
@@ -972,6 +1011,36 @@ class LiveView(QtWidgets.QMainWindow):
         ys = np.concatenate([cy + ex * s_ + ey * c, [np.nan, cy - wx * s_, cy + wx * s_, np.nan, cy - wy * c, cy + wy * c]])
         self.fit_curve.setData(xs, ys)
 
+    def _fit_average(self) -> dict | None:
+        """Plain mean and standard deviation of the logged centres (sensor pixels), or None before 2 fits."""
+        if len(self._fit_history) < 2:
+            return None
+        h = np.array(self._fit_history)
+        mean, sd = h.mean(axis=0), h.std(axis=0, ddof=1)
+        return dict(n=len(h), x0=float(mean[0]), y0=float(mean[1]), x_sd=float(sd[0]), y_sd=float(sd[1]))
+
+    def _average_text(self, scale: float, unit: str) -> str:
+        avg = self._fit_average()
+        if avg is None:
+            return ""
+        x, y = self._in_fit_frame(avg["x0"], avg["y0"])
+        return (f"<br>Average centre of the last {avg['n']} fits: x = <b>{x * scale:.2f}</b> ± {avg['x_sd'] * scale:.2f}, "
+                f"y = <b>{y * scale:.2f}</b> ± {avg['y_sd'] * scale:.2f} {unit} (± = standard deviation)")
+
+    def _fit_window_changed(self, text: str):
+        """Parse the fit-window box: 'full frame', or a half-size in px ('±50 px', '50')."""
+        text = text.strip().lower()
+        if text.startswith("full"):
+            half = None
+        else:
+            m = re.search(r"\d+", text)
+            if m is None:
+                return                                     # still typing
+            half = int(np.clip(int(m.group()), 3, 5000))
+        if half != self._fit_half:
+            self._fit_half = half
+            self._fit_history.clear()                      # a different window gives different values
+
     def _in_fit_frame(self, x0: float, y0: float) -> tuple[float, float]:
         """Sensor pixel coordinates -> the origin chosen in the fit menu (still in pixels)."""
         if self.fit_origin.currentIndex() == 1:       # (0, 0) at the centre of the sensor
@@ -980,12 +1049,20 @@ class LiveView(QtWidgets.QMainWindow):
 
     # ---------- position marker ----------
 
-    def mark_centre(self):
-        """Put the cross at the most recent Gaussian centre."""
-        if self._fit is None or "error" in self._fit:
-            QtWidgets.QMessageBox.information(self, "Mark centre", "No Gaussian fit yet: switch the fit on.")
-            return
-        self._mark = (self._fit["x0"], self._fit["y0"])
+    def mark_centre(self, source: str = "current"):
+        """Put the cross at the most recent Gaussian centre ('current') or the running average ('average')."""
+        if source == "average":
+            avg = self._fit_average()
+            if avg is None:
+                QtWidgets.QMessageBox.information(self, "Mark average", "Fewer than 2 fits so far: switch the fit "
+                                                  "on and wait a moment.")
+                return
+            self._mark, self._mark_note = (avg["x0"], avg["y0"]), f"mean of {avg['n']} fits"
+        else:
+            if self._fit is None or "error" in self._fit:
+                QtWidgets.QMessageBox.information(self, "Mark centre", "No Gaussian fit yet: switch the fit on.")
+                return
+            self._mark, self._mark_note = (self._fit["x0"], self._fit["y0"]), ""
         self._show_mark()
 
     def remove_mark(self):
@@ -1001,8 +1078,9 @@ class LiveView(QtWidgets.QMainWindow):
         self.mark_item.setData([x0 + 0.5], [y0 + 0.5])       # pixel i spans [i, i + 1)
         scale, unit = self.fit_units.currentData(), "px" if self.fit_units.currentIndex() == 0 else "µm"
         x, y = self._in_fit_frame(x0, y0)
+        note = f" ({self._mark_note})" if self._mark_note else ""
         self.legend.addItem(self.mark_item, f"{self.mark_name.text().strip() or 'marked centre'}: "
-                                            f"x = {x * scale:.2f}, y = {y * scale:.2f} {unit}")
+                                            f"x = {x * scale:.2f}, y = {y * scale:.2f} {unit}{note}")
 
     # ---------- dead pixels ----------
 
@@ -1140,8 +1218,10 @@ class LiveView(QtWidgets.QMainWindow):
         store = QtCore.QSettings(*self._settings)
         store.setValue("geometry", self.saveGeometry())
         store.setValue("state", self.saveState())
-        store.setValue("mark", list(self._mark) if self._mark is not None else None)
+        store.setValue("mark", [float(v) for v in self._mark] if self._mark is not None else None)
         store.setValue("mark_name", self.mark_name.text())
+        store.setValue("mark_note", self._mark_note)
+        store.setValue("fit_window", self.fit_window.currentText())
         self.set_live(False)
         super().closeEvent(event)
 
