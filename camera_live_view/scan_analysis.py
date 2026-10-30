@@ -63,8 +63,12 @@ def parabola_focus(z: np.ndarray, w: np.ndarray) -> dict | None:
                 inside=bool(z.min() <= a <= z.max()))
 
 
-def fit_scan(folder) -> dict:
-    """Gaussian fit of every frame of the scan: positions, wx, wy (sensor axes), peaks, units."""
+def fit_scan(folder, position_scale: float = 1.0) -> dict:
+    """
+    Gaussian fit of every frame of the scan: positions, wx, wy (sensor axes),
+    peaks, units. The recorded positions are multiplied by position_scale
+    (e.g. 25.4 for a scan whose steps were typed in mm but moved in inches).
+    """
     scan = PositionScan.load(folder)
     cam = scan.meta.get("camera", {})
     dead = load_dead_pixels(cam["dead_pixel_file"]) if cam.get("dead_pixel_file") else None
@@ -82,22 +86,23 @@ def fit_scan(folder) -> dict:
             continue
         # radii along the sensor axes: the fitted axis closest to x is "x"
         rx, ry = (fit["wx"], fit["wy"]) if abs(fit["theta"]) <= np.pi / 4 else (fit["wy"], fit["wx"])
-        positions.append(entry["position"])
+        positions.append(entry["position"] * position_scale)
         wx.append(rx * scale)
         wy.append(ry * scale)
         peaks.append(fit["peak"])
     return dict(folder=str(scan.folder), name=scan.meta.get("name", ""), unit=scan.unit, w_unit=w_unit, px=scale,
+                position_scale=position_scale,
                 positions=np.array(positions), wx=np.array(wx), wy=np.array(wy), peaks=np.array(peaks),
                 failed=failed, max_value=cam.get("max_value"))
 
 
-def waist_vs_position(folder, fig: Figure | None = None) -> Figure:
+def waist_vs_position(folder, fig: Figure | None = None, position_scale: float = 1.0) -> Figure:
     """
     1/e² radii along x and y against position, the fitted caustic of each and
     the focus (its minimum) as a vertical line, plus the mean focal plane.
     Draws into `fig` (e.g. one from pyplot) or a new Figure.
     """
-    r = fit_scan(folder)
+    r = fit_scan(folder, position_scale)
     z, unit = r["positions"], r["unit"]
     fits = {axis: parabola_focus(z, r[f"w{axis}"]) for axis in ("x", "y")}
     foci = [f["a"] for f in fits.values() if f is not None]
@@ -126,6 +131,8 @@ def waist_vs_position(folder, fig: Figure | None = None) -> Figure:
         z_focus = float(np.mean(foci))
         ax.axvline(z_focus, color="k", ls="--", label=f"focal plane {z_focus:+.3f} {unit} (mean of x and y)")
     title = f"{r['name']}: Gaussian waist vs position\nfit per axis: w(z) = c (z − a)² + b, focus at the vertex a"
+    if position_scale != 1.0:
+        title += f"\nrecorded positions × {position_scale:g}"
     if r["failed"]:
         title += f"   (no fit at {', '.join(f'{p:+.3f}' for p in r['failed'])} {unit})"
     if r["max_value"] and len(r["peaks"]) and r["peaks"].max() >= 0.99 * r["max_value"]:

@@ -18,6 +18,8 @@ CONFIG = {
     "folder": None,          # a scan folder, or None for the most recent one under data_root/alignment_data
     "data_root": Path(__file__).resolve().parents[1] / "data",
     "analysis": "Gaussian waist vs position (parabola focus)",
+    "position_scale": 1.0,   # multiplies the recorded positions: 25.4 if the steps were typed in mm
+                             # but the stage moved in inches (0.1 "mm" -> 0.1 inch = 2.54 mm)
 }
 
 
@@ -27,7 +29,7 @@ def main():
         raise SystemExit(f"No scan under {CONFIG['data_root'] / 'alignment_data'}")
     fig = plt.figure(figsize=(8, 5.5))
     fig.canvas.manager.set_window_title(f"{CONFIG['analysis']} — {Path(folder).name}")
-    ANALYSES[CONFIG["analysis"]](folder, fig=fig)
+    ANALYSES[CONFIG["analysis"]](folder, fig=fig, position_scale=CONFIG["position_scale"])
     plt.show()
 
 
