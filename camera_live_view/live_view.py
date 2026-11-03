@@ -366,7 +366,7 @@ class LiveView(QtWidgets.QMainWindow):
         self.fit_ellipse.setChecked(True)
         for w in (self.fit_units, self.fit_origin):
             w.currentIndexChanged.connect(self._show_fit)
-            w.currentIndexChanged.connect(lambda _: self._show_mark())
+            w.currentIndexChanged.connect(lambda _: self._show_references())
         self.fit_ellipse.toggled.connect(self._show_fit)
         fit_form = QtWidgets.QFormLayout()
         fit_form.addRow("Units", self.fit_units)
@@ -389,27 +389,48 @@ class LiveView(QtWidgets.QMainWindow):
         self.dead_show.setToolTip("Circles: dead pixels; dots: dark-spot pixels")
         self.dead_show.toggled.connect(self._show_dead)
 
-        # position marker: a cross at the most recent Gaussian centre, named in the legend
-        self.mark_name = QtWidgets.QLineEdit("marked centre")
-        self.mark_name.setToolTip("Legend name of the marker, e.g. 'optical axis'")
-        self.mark_name.textChanged.connect(lambda _: self._show_mark())
-        mark_btn = QtWidgets.QPushButton("Mark current")
-        mark_btn.setToolTip("Put a cross at the most recent Gaussian centre (click again to move it there)")
-        mark_btn.clicked.connect(lambda: self.mark_centre("current"))
-        mark_avg_btn = QtWidgets.QPushButton("Mark average")
-        mark_avg_btn.setToolTip("Put a cross at the running-average centre of the last N fits")
-        mark_avg_btn.clicked.connect(lambda: self.mark_centre("average"))
-        unmark_btn = QtWidgets.QPushButton("Remove mark")
-        unmark_btn.clicked.connect(lambda: self.remove_mark())
-        mark_row = QtWidgets.QHBoxLayout()
-        mark_row.addWidget(mark_btn)
-        mark_row.addWidget(mark_avg_btn)
-        mark_form = QtWidgets.QFormLayout()
-        mark_form.addRow("Marker", self.mark_name)
-        mark_form.addRow(mark_row)
-        mark_form.addRow(unmark_btn)
-        mark_widget = QtWidgets.QWidget()
-        mark_widget.setLayout(mark_form)
+        # reference points (e.g. the optical axis): named crosses kept per camera, several at once
+        self.ref_name = QtWidgets.QLineEdit("optical axis")
+        self.ref_name.setToolTip("Name of the point to add; adding with an existing name moves that point")
+        add_current = QtWidgets.QPushButton("Add at current fit")
+        add_current.clicked.connect(lambda: self.add_reference("current"))
+        add_average = QtWidgets.QPushButton("Add at average")
+        add_average.setToolTip("At the mean centre of the last N fits")
+        add_average.clicked.connect(lambda: self.add_reference("average"))
+        self.ref_x, self.ref_y = QtWidgets.QDoubleSpinBox(), QtWidgets.QDoubleSpinBox()
+        for spin in (self.ref_x, self.ref_y):
+            spin.setRange(-99999.99, 99999.99)
+            spin.setDecimals(2)
+            spin.setKeyboardTracking(False)
+        add_typed = QtWidgets.QPushButton("Add typed")
+        add_typed.setToolTip("At the x, y typed here, in the units and origin of the Gaussian fit menu")
+        add_typed.clicked.connect(lambda: self.add_reference("typed"))
+        self.ref_units = QtWidgets.QLabel()
+        self.ref_units.setStyleSheet("color: gray")
+        self.ref_units.setWordWrap(True)
+        self.ref_list = QtWidgets.QComboBox()
+        self.ref_list.setToolTip("Saved points; selecting one copies its name and position into the fields above")
+        self.ref_list.currentIndexChanged.connect(self._reference_selected)
+        remove_ref = QtWidgets.QPushButton("Remove")
+        remove_ref.clicked.connect(lambda: self.remove_reference())
+        remove_all = QtWidgets.QPushButton("Remove all")
+        remove_all.clicked.connect(lambda: self.remove_reference(all_points=True))
+
+        ref_form = QtWidgets.QFormLayout()
+        ref_form.addRow("Name", self.ref_name)
+        ref_form.addRow(add_current)
+        ref_form.addRow(add_average)
+        ref_form.addRow("Typed x", self.ref_x)
+        ref_form.addRow("Typed y", self.ref_y)
+        ref_form.addRow(self.ref_units)
+        ref_form.addRow(add_typed)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.ref_list, 1)
+        row.addWidget(remove_ref)
+        ref_form.addRow(row)
+        ref_form.addRow(remove_all)
+        ref_widget = QtWidgets.QWidget()
+        ref_widget.setLayout(ref_form)
 
         self.log_scale = QtWidgets.QCheckBox("Logarithmic colour scale")
         self.log_scale.setChecked(True)
@@ -421,8 +442,9 @@ class LiveView(QtWidgets.QMainWindow):
         layout.addWidget(self._group("Gain", self.gain))
         layout.addWidget(self._group("Readout region (camera)", roi_widget, apply, full, self.show_roi))
         layout.addWidget(self._group("Background", self.bg_label, record, load, self.subtract, self.bg_warning))
-        layout.addWidget(self._group("Gaussian fit", self.fit_on, fit_widget, self.fit_ellipse, mark_widget,
+        layout.addWidget(self._group("Gaussian fit", self.fit_on, fit_widget, self.fit_ellipse,
                                      self.dead_label, find_dead, self.dead_ignore, self.dead_show))
+        layout.addWidget(self._group("Reference points", ref_widget))
         layout.addWidget(self._group("Display", self.log_scale))
         layout.addStretch(1)
         # The settings live in a dock: scrollable (never taller than the screen), draggable to the
@@ -731,23 +753,13 @@ class LiveView(QtWidgets.QMainWindow):
         self._load_dead_pixels()
         self.legend = self.plot.addLegend(offset=(-10, 10), brush=(0, 0, 0, 170), pen="w",   # top right, readable
                                           labelTextColor="w", labelTextSize="10pt")
-        self.mark_item = pg.ScatterPlotItem(symbol="+", size=26, pen=pg.mkPen("m", width=2.5), brush=None, pxMode=True)
-        self.mark_item.setZValue(13)
-        self.plot.addItem(self.mark_item)
+        self._ref_items = []      # one cross per reference point
+        self._refs = self._load_references()
         store = QtCore.QSettings(*self._settings)
-        try:
-            self._mark = store.value("mark", None)   # (x0, y0) in sensor pixels, remembered between runs
-            self._mark = None if self._mark is None else tuple(float(v) for v in self._mark)
-        except (RuntimeError, TypeError, ValueError):  # unreadable entry: start without a mark
-            self._mark = None
-        self._mark_note = ""
-        if self._mark is not None:
-            self.mark_name.setText(store.value("mark_name", "marked centre"))
-            self._mark_note = str(store.value("mark_note", "") or "")
         window = store.value("fit_window", None)
         if window:
             self.fit_window.setCurrentText(str(window))
-        self._show_mark()
+        self._show_references()
         self._mouse_pos = None
         self.plot.scene().sigMouseMoved.connect(self._mouse_moved)
 
@@ -1047,40 +1059,123 @@ class LiveView(QtWidgets.QMainWindow):
             return x0 - (self.cam.sensor_width - 1) / 2, y0 - (self.cam.sensor_height - 1) / 2
         return x0, y0
 
-    # ---------- position marker ----------
+    # ---------- reference points ----------
 
-    def mark_centre(self, source: str = "current"):
-        """Put the cross at the most recent Gaussian centre ('current') or the running average ('average')."""
+    REF_COLOURS = ("#ff00ff", "#00ffff", "#ffa500", "#ffffff", "#7fff00", "#ff69b4", "#1e90ff", "#ffd700")
+
+    @property
+    def _camera_key(self) -> str:
+        """Identifies the camera, so each camera keeps its own reference points."""
+        ident = getattr(self.cam, "serial", None) or getattr(self.cam, "camera_id", None) or "default"
+        return f"{type(self.cam).__name__}_{ident}"
+
+    def _load_references(self) -> list[dict]:
+        """Reference points of this camera from the settings; the old single marker becomes the first one."""
+        store = QtCore.QSettings(*self._settings)
+        key = f"reference_points/{self._camera_key}"
+        try:
+            refs = [dict(name=str(r["name"]), x=float(r["x"]), y=float(r["y"]), note=str(r.get("note", "")))
+                    for r in json.loads(store.value(key, "[]") or "[]")]
+        except (ValueError, TypeError, KeyError, RuntimeError):
+            refs = []
+        if store.contains("mark"):                    # marker saved by an earlier version of the viewer
+            try:
+                old = store.value("mark", None)
+                if old is not None and not refs:
+                    refs = [dict(name=str(store.value("mark_name", "marked centre") or "marked centre"),
+                                 x=float(old[0]), y=float(old[1]), note=str(store.value("mark_note", "") or ""))]
+            except (RuntimeError, TypeError, ValueError, IndexError):
+                pass
+            for k in ("mark", "mark_name", "mark_note"):
+                store.remove(k)
+            store.setValue(key, json.dumps(refs))
+        return refs
+
+    def _save_references(self):
+        QtCore.QSettings(*self._settings).setValue(f"reference_points/{self._camera_key}", json.dumps(self._refs))
+
+    def _from_fit_frame(self, x: float, y: float) -> tuple[float, float]:
+        """Coordinates in the fit menu's units and origin -> sensor pixels (inverse of _in_fit_frame)."""
+        scale = self.fit_units.currentData()
+        x, y = x / scale, y / scale
+        if self.fit_origin.currentIndex() == 1:
+            return x + (self.cam.sensor_width - 1) / 2, y + (self.cam.sensor_height - 1) / 2
+        return x, y
+
+    def add_reference(self, source: str = "current"):
+        """Save a named point at the current fit centre, the averaged centre, or the typed x, y."""
+        name = self.ref_name.text().strip() or f"point {len(self._refs) + 1}"
         if source == "average":
             avg = self._fit_average()
             if avg is None:
-                QtWidgets.QMessageBox.information(self, "Mark average", "Fewer than 2 fits so far: switch the fit "
+                QtWidgets.QMessageBox.information(self, "Reference point", "Fewer than 2 fits so far: switch the fit "
                                                   "on and wait a moment.")
                 return
-            self._mark, self._mark_note = (avg["x0"], avg["y0"]), f"mean of {avg['n']} fits"
+            x0, y0, note = avg["x0"], avg["y0"], f"mean of {avg['n']} fits"
+        elif source == "typed":
+            (x0, y0), note = self._from_fit_frame(self.ref_x.value(), self.ref_y.value()), "typed"
         else:
             if self._fit is None or "error" in self._fit:
-                QtWidgets.QMessageBox.information(self, "Mark centre", "No Gaussian fit yet: switch the fit on.")
+                QtWidgets.QMessageBox.information(self, "Reference point", "No Gaussian fit yet: switch the fit on.")
                 return
-            self._mark, self._mark_note = (self._fit["x0"], self._fit["y0"]), ""
-        self._show_mark()
+            x0, y0, note = self._fit["x0"], self._fit["y0"], ""
+        point = dict(name=name, x=float(x0), y=float(y0), note=note)
+        names = [r["name"] for r in self._refs]
+        if name in names:
+            self._refs[names.index(name)] = point      # same name: move that point
+        else:
+            self._refs.append(point)
+        self._save_references()
+        self._show_references(select=name)
 
-    def remove_mark(self):
-        self._mark = None
-        self._show_mark()
+    def remove_reference(self, all_points: bool = False):
+        if all_points:
+            if self._refs and QtWidgets.QMessageBox.question(
+                    self, "Reference points", f"Remove all {len(self._refs)} reference points?") \
+                    != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+            self._refs = []
+        elif 0 <= self.ref_list.currentIndex() < len(self._refs):
+            del self._refs[self.ref_list.currentIndex()]
+        self._save_references()
+        self._show_references()
 
-    def _show_mark(self):
-        self.legend.removeItem(self.mark_item)
-        if self._mark is None:
-            self.mark_item.setData([], [])
-            return
-        x0, y0 = self._mark
-        self.mark_item.setData([x0 + 0.5], [y0 + 0.5])       # pixel i spans [i, i + 1)
+    def _reference_selected(self, index: int):
+        """Copy the selected point into the name and x, y fields (to edit and re-add it)."""
+        if 0 <= index < len(self._refs):
+            r = self._refs[index]
+            scale = self.fit_units.currentData()
+            x, y = self._in_fit_frame(r["x"], r["y"])
+            self.ref_name.setText(r["name"])
+            self.ref_x.setValue(x * scale)
+            self.ref_y.setValue(y * scale)
+
+    def _show_references(self, select: str | None = None):
+        """Crosses and legend entries for all points, the drop-down, and the unit note of the typed fields."""
         scale, unit = self.fit_units.currentData(), "px" if self.fit_units.currentIndex() == 0 else "µm"
-        x, y = self._in_fit_frame(x0, y0)
-        note = f" ({self._mark_note})" if self._mark_note else ""
-        self.legend.addItem(self.mark_item, f"{self.mark_name.text().strip() or 'marked centre'}: "
-                                            f"x = {x * scale:.2f}, y = {y * scale:.2f} {unit}{note}")
+        origin = "top-left pixel" if self.fit_origin.currentIndex() == 0 else "camera centre"
+        self.ref_units.setText(f"typed x, y in {unit}, (0, 0) at the {origin}")
+        for item in self._ref_items:
+            self.legend.removeItem(item)
+            self.plot.removeItem(item)
+        self._ref_items = []
+        current = select or self.ref_list.currentText()
+        self.ref_list.blockSignals(True)
+        self.ref_list.clear()
+        for i, r in enumerate(self._refs):
+            colour = self.REF_COLOURS[i % len(self.REF_COLOURS)]
+            item = pg.ScatterPlotItem([r["x"] + 0.5], [r["y"] + 0.5],   # pixel i spans [i, i + 1)
+                                      symbol="+", size=26, pen=pg.mkPen(colour, width=2.5), brush=None, pxMode=True)
+            item.setZValue(13)
+            self.plot.addItem(item)
+            x, y = self._in_fit_frame(r["x"], r["y"])
+            note = f" ({r['note']})" if r["note"] else ""
+            self.legend.addItem(item, f"{r['name']}: x = {x * scale:.2f}, y = {y * scale:.2f} {unit}{note}")
+            self._ref_items.append(item)
+            self.ref_list.addItem(r["name"])
+        if current in [r["name"] for r in self._refs]:
+            self.ref_list.setCurrentText(current)
+        self.ref_list.blockSignals(False)
 
     # ---------- dead pixels ----------
 
@@ -1218,9 +1313,6 @@ class LiveView(QtWidgets.QMainWindow):
         store = QtCore.QSettings(*self._settings)
         store.setValue("geometry", self.saveGeometry())
         store.setValue("state", self.saveState())
-        store.setValue("mark", [float(v) for v in self._mark] if self._mark is not None else None)
-        store.setValue("mark_name", self.mark_name.text())
-        store.setValue("mark_note", self._mark_note)
         store.setValue("fit_window", self.fit_window.currentText())
         self.set_live(False)
         super().closeEvent(event)

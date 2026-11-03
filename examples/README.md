@@ -79,10 +79,11 @@ PATH); otherwise set `CINCAM_UC480_DLL` to the full path of `uc480_64.dll`.
   "full frame" for a beam larger than the sensor; its centre may then lie off the chip and
   is flagged as extrapolated. Any half-size can be typed. Under the current fit the readout
   shows the plain mean and standard deviation of the last N fitted centres (default 10).
-  "Mark current" / "Mark average" put a magenta cross at the latest or the averaged centre
-  and list its coordinates in the image legend under the name you give it (e.g. "optical
-  axis"): a position marker for realigning optics. Click again to move it, "Remove mark" to
-  clear it; it is remembered between runs.
+  "Reference points" (e.g. the optical axis, for realigning optics): give a name and add the
+  point at the current fit centre, at the averaged centre, or at a typed x, y (in the units
+  and origin of the fit menu). All points are drawn as coloured crosses with their
+  coordinates in the image legend; adding with an existing name moves that point, the
+  drop-down removes one, "Remove all" clears them. Points are kept per camera between runs.
 - Dead pixels and dark spots (same group): light the whole sensor with a clean, broad
   beam, read out the full sensor and press "Find dead pixels". Eight frames are averaged
   and two kinds of bad pixels are mapped. A *dead pixel* is a single pixel at least 30 %
