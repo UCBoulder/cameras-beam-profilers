@@ -65,6 +65,14 @@ PATH); otherwise set `CINCAM_UC480_DLL` to the full path of `uc480_64.dll`.
   plane, per axis and averaged. `examples/analyze_scan.py` runs the same analysis on a
   saved scan; add your own to `scan_analysis.ANALYSES` (a function `folder -> Figure`)
   and it appears in the dock's menu.
+- Live view "Alignment" dock, **PSF vs target and camera position**: place the orange
+  analysis square on the PSF ("Centre region on the current fit", or drag it), start, then
+  for every shot type the target z and camera z and take a snapshot; take a background with
+  the PSF light blocked (one per exposure and gain used; finishing asks for any missing).
+  Frames go to `data/experiment_data/<name>_<time>/` with `scan.json` (both positions, the
+  analysis region, exposure, gain and readout region per shot). The analysis is plugged in
+  by the program that starts the viewer: Objective-testing's `scripts/live_view.py` adds
+  the Strehl-ratio map, which runs when the experiment is finished.
 - Live view mouse: wheel zooms, right-drag pans, left-drag moves or resizes the yellow
   readout rectangle. The save button stores the raw frame even when background
   subtraction is shown, and records the background file in the metadata.

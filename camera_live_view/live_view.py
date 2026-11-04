@@ -246,12 +246,15 @@ class LiveView(QtWidgets.QMainWindow):
         self._dead_accum = None     # raw frames being averaged for "Find dead pixels"
         self._raw_last = None       # newest raw frame (before background subtraction)
         self._scan = None           # running PositionScan, see _build_alignment
+        self._pz = None             # running two-axis PSF experiment (PositionScan with axes)
+        self.pz_roi = None          # its analysis region on the image
         self._figures = []          # analysis windows kept alive
 
         self._build_toolbar()
         self._build_controls()
         self._build_alignment()
         self._build_image()
+        self._show_psf_region()
         self.status = QtWidgets.QLabel()
         self.statusBar().addPermanentWidget(self.status, 1)
 
@@ -535,6 +538,89 @@ class LiveView(QtWidgets.QMainWindow):
         for btn in (self.scan_btn_take, self.scan_btn_retake, self.scan_btn_finish, self.scan_btn_cancel):
             btn.setEnabled(False)
 
+
+        # ---- PSF vs target and camera position: two typed positions per snapshot, analysis region, backgrounds ----
+        W, H = self.cam.sensor_width, self.cam.sensor_height
+        self.pz_name = QtWidgets.QLineEdit("PSF-target-camera_position dependance")
+        self.pz_unit = QtWidgets.QComboBox()
+        for unit, to_mm in self.SCAN_UNITS.items():
+            self.pz_unit.addItem(unit, to_mm)
+        self.pz_unit.setMaximumWidth(90)
+        self.pz_unit.setToolTip("Unit of the positions you type; everything is saved in mm")
+        self.pz_target, self.pz_camera = QtWidgets.QDoubleSpinBox(), QtWidgets.QDoubleSpinBox()
+        for spin in (self.pz_target, self.pz_camera):
+            spin.setRange(-1e4, 1e4)
+            spin.setDecimals(3)
+            spin.setKeyboardTracking(False)
+            spin.valueChanged.connect(lambda _: self._pz_say(self.pz_status.text()))
+        self.pz_target.setToolTip("Where the target (pinhole) is for the next snapshot")
+        self.pz_camera.setToolTip("Where the camera is for the next snapshot")
+        self.pz_rx, self.pz_ry, self.pz_rsize = QtWidgets.QSpinBox(), QtWidgets.QSpinBox(), QtWidgets.QSpinBox()
+        self.pz_rx.setRange(0, W - 1)
+        self.pz_ry.setRange(0, H - 1)
+        self.pz_rsize.setRange(10, max(W, H))
+        self.pz_rx.setValue(W // 2)
+        self.pz_ry.setValue(H // 2)
+        self.pz_rsize.setValue(200)
+        for spin in (self.pz_rx, self.pz_ry, self.pz_rsize):
+            spin.setSuffix(" px")
+            spin.setKeyboardTracking(False)
+            spin.valueChanged.connect(lambda _: self._show_psf_region())
+        region_centre = QtWidgets.QPushButton("Centre region on the current fit")
+        region_centre.setToolTip("Centre the analysis region on the latest Gaussian centre (or the brightest pixel)")
+        region_centre.clicked.connect(lambda: self.pz_centre_on_fit())
+        self.pz_show = QtWidgets.QCheckBox("Show the analysis region (orange square)")
+        self.pz_show.setChecked(True)
+        self.pz_show.toggled.connect(lambda _: self._show_psf_region())
+        self.pz_analysis = QtWidgets.QComboBox()
+        self.pz_analysis.addItems(list(ANALYSES))
+        self.pz_analysis.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.pz_analysis.setMinimumContentsLength(12)
+        strehl = [name for name in ANALYSES if "strehl" in name.lower()]
+        if strehl:
+            self.pz_analysis.setCurrentText(strehl[0])
+        self.pz_run = QtWidgets.QCheckBox("Analyse when finished")
+        self.pz_run.setChecked(bool(strehl))
+        if not strehl:
+            self.pz_run.setToolTip("No Strehl analysis registered: start the viewer with Objective-testing's "
+                                   "scripts/live_view.py, or analyse later with scripts/analyze_strehl_map.py")
+        pz_form = QtWidgets.QFormLayout()
+        pz_form.addRow("Name", self.pz_name)
+        pz_form.addRow("Unit", self.pz_unit)
+        pz_form.addRow("Target z", self.pz_target)
+        pz_form.addRow("Camera z", self.pz_camera)
+        pz_form.addRow("Region centre x", self.pz_rx)
+        pz_form.addRow("Region centre y", self.pz_ry)
+        pz_form.addRow("Region side", self.pz_rsize)
+        pz_form.addRow("Analysis", self.pz_analysis)
+        pz_widget = QtWidgets.QWidget()
+        pz_widget.setLayout(pz_form)
+
+        self.pz_status = QtWidgets.QLabel("No experiment running.")
+        self.pz_status.setWordWrap(True)
+        self.pz_btn_start = QtWidgets.QPushButton("Start experiment")
+        self.pz_btn_start.clicked.connect(lambda: self.pz_begin())
+        self.pz_btn_take = QtWidgets.QPushButton("Take snapshot")
+        self.pz_btn_take.clicked.connect(lambda: self.pz_take())
+        self.pz_btn_drop = QtWidgets.QPushButton("Drop last snapshot")
+        self.pz_btn_drop.clicked.connect(lambda: self.pz_drop_last())
+        self.pz_btn_bg = QtWidgets.QPushButton("Take background (PSF light blocked)")
+        self.pz_btn_bg.clicked.connect(lambda: self.pz_background())
+        self.pz_btn_finish = QtWidgets.QPushButton("Finish experiment")
+        self.pz_btn_finish.clicked.connect(lambda: self.pz_finish())
+        self.pz_btn_cancel = QtWidgets.QPushButton("Cancel experiment")
+        self.pz_btn_cancel.clicked.connect(lambda: self.pz_cancel())
+        pz_saved = QtWidgets.QPushButton("Analyse a saved experiment…")
+        pz_saved.clicked.connect(lambda: self.pz_analyse_folder())
+        self._pz_buttons(False)
+        pz_help = QtWidgets.QLabel(
+            "Strehl ratio against target and camera position: set the analysis region on the PSF, start, then for "
+            "every shot type the target z and camera z and take a snapshot. Take a background with the PSF light "
+            "blocked (one per exposure and gain used). Frames go to data/experiment_data/&lt;name&gt;_&lt;time&gt;/ "
+            "with scan.json; when finished, the Strehl ratio of every shot is mapped against the two positions.")
+        pz_help.setWordWrap(True)
+        pz_help.setStyleSheet("color: gray")
+
         help_text = QtWidgets.QLabel(
             "Find the focal plane of a lens: put the camera at the start position, start the scan, take a "
             "snapshot, move the camera by the step, take the next, … and finish. Positions are saved in mm "
@@ -549,6 +635,10 @@ class LiveView(QtWidgets.QMainWindow):
         layout.addWidget(self._group("Focal plane scan", help_text, form_widget, self.scan_run, self.scan_status,
                                      self.scan_btn_start, self.scan_btn_take, self.scan_btn_retake,
                                      self.scan_btn_finish, self.scan_btn_cancel, analyse))
+        layout.addWidget(self._group("PSF vs target and camera position", pz_help, pz_widget, region_centre,
+                                     self.pz_show, self.pz_run, self.pz_status, self.pz_btn_start, self.pz_btn_take,
+                                     self.pz_btn_drop, self.pz_btn_bg, self.pz_btn_finish, self.pz_btn_cancel,
+                                     pz_saved))
         layout.addStretch(1)
         scroll = QtWidgets.QScrollArea()
         scroll.setWidget(panel)
@@ -676,14 +766,203 @@ class LiveView(QtWidgets.QMainWindow):
         if folder:
             self.scan_analyse(Path(folder))
 
-    def scan_analyse(self, folder: Path):
-        name = self.scan_analysis.currentText()
+    def scan_analyse(self, folder: Path, name: str | None = None):
+        name = name or self.scan_analysis.currentText()
+        if name not in ANALYSES:
+            QtWidgets.QMessageBox.information(self, "Analysis", "No analysis selected.")
+            return
         try:
             fig = ANALYSES[name](folder)
         except Exception as err:   # a bad scan must not take the viewer down
             QtWidgets.QMessageBox.critical(self, name, f"{type(err).__name__}: {err}")
             return
         self.show_figure(fig, f"{name} — {Path(folder).name}")
+
+    # ---------- PSF vs target and camera position ----------
+
+    PZ_AXES = ("target_z", "camera_z")
+
+    def _pz_region(self) -> dict:
+        return dict(centre=[self.pz_rx.value(), self.pz_ry.value()], size=self.pz_rsize.value())
+
+    def _show_psf_region(self):
+        """Draw the analysis region (a square centred on the region centre; pixel i spans [i, i + 1))."""
+        if not hasattr(self, "plot"):
+            return
+        r = self._pz_region()
+        pos = (r["centre"][0] + 0.5 - r["size"] / 2, r["centre"][1] + 0.5 - r["size"] / 2)
+        if self.pz_roi is None:
+            self.pz_roi = pg.ROI(pos, (r["size"], r["size"]), movable=True, rotatable=False, resizable=False,
+                                 pen=pg.mkPen("#ff8c00", width=2, style=QtCore.Qt.PenStyle.DashLine))
+            self.pz_roi.setZValue(10)
+            self.plot.addItem(self.pz_roi)
+            self.pz_roi.sigRegionChangeFinished.connect(self._pz_region_dragged)
+        self.pz_roi.blockSignals(True)
+        self.pz_roi.setPos(pos, update=False)
+        self.pz_roi.setSize((r["size"], r["size"]), update=False)
+        self.pz_roi.stateChanged(finish=False)
+        self.pz_roi.blockSignals(False)
+        self.pz_roi.setVisible(self.pz_show.isChecked())
+
+    def _pz_region_dragged(self):
+        """The square was dragged on the image: follow it with the centre fields."""
+        pos, size = self.pz_roi.pos(), self.pz_rsize.value()
+        for spin, v in ((self.pz_rx, pos.x() + size / 2 - 0.5), (self.pz_ry, pos.y() + size / 2 - 0.5)):
+            spin.blockSignals(True)
+            spin.setValue(int(round(v)))
+            spin.blockSignals(False)
+        self._show_psf_region()
+
+    def pz_centre_on_fit(self):
+        if self._fit is not None and "error" not in self._fit:
+            x, y = self._fit["x0"], self._fit["y0"]
+        elif self._raw_last is not None:
+            y, x = np.unravel_index(int(np.argmax(self._raw_last)), self._raw_last.shape)
+            x, y = x + self._aoi["offset_x"], y + self._aoi["offset_y"]
+        else:
+            QtWidgets.QMessageBox.information(self, "Analysis region", "No frame yet: start the live stream.")
+            return
+        self.pz_rx.setValue(int(round(x)))
+        self.pz_ry.setValue(int(round(y)))
+
+    def _pz_buttons(self, running: bool):
+        self.pz_btn_start.setEnabled(not running)
+        for w in (self.pz_name, self.pz_unit):
+            w.setEnabled(not running)
+        for b in (self.pz_btn_take, self.pz_btn_bg, self.pz_btn_finish, self.pz_btn_cancel):
+            b.setEnabled(running)
+        self.pz_btn_drop.setEnabled(running and self._pz is not None and len(self._pz) > 0)
+
+    def _pz_positions(self) -> dict:
+        to_mm = self.pz_unit.currentData()
+        return {"target_z": self.pz_target.value() * to_mm, "camera_z": self.pz_camera.value() * to_mm}
+
+    def _pz_where(self, positions: dict) -> str:
+        unit, to_mm = self.pz_unit.currentText(), self.pz_unit.currentData()
+        def one(mm):
+            return f"{mm:+.3f} mm" + (f" ({mm / to_mm:+.3f} {unit})" if unit != "mm" else "")
+        return f"target {one(positions['target_z'])}, camera {one(positions['camera_z'])}"
+
+    def _pz_say(self, text: str):
+        if self._pz is not None:
+            self.pz_btn_take.setText(f"Take snapshot at {self._pz_where(self._pz_positions())}")
+        self.pz_status.setText(text)
+
+    def _region_peak(self, frame: np.ndarray) -> float:
+        """Highest raw count inside the analysis region (0 if the region misses the readout)."""
+        r, a = self._pz_region(), self._aoi
+        half = r["size"] // 2
+        x0, y0 = max(r["centre"][0] - half - a["offset_x"], 0), max(r["centre"][1] - half - a["offset_y"], 0)
+        x1, y1 = r["centre"][0] + half - a["offset_x"] + 1, r["centre"][1] + half - a["offset_y"] + 1
+        part = frame[y0:max(y1, y0), x0:max(x1, x0)]
+        return float(part.max()) if part.size else 0.0
+
+    def pz_begin(self):
+        try:
+            self._pz = PositionScan.start(self.data_root, self.pz_name.text(), unit="mm", camera=self.cam,
+                                          subfolder="experiment_data", axes=self.PZ_AXES,
+                                          input_unit=self.pz_unit.currentText(), analysis_region=self._pz_region())
+        except OSError as err:
+            QtWidgets.QMessageBox.critical(self, "Experiment", str(err))
+            return
+        self.pz_show.setChecked(True)
+        self._pz_buttons(True)
+        self._pz_say(f"Experiment folder: {self._pz.folder.name}<br>Type the target and camera positions and take "
+                     f"the first snapshot. Keep the PSF inside the orange square.")
+
+    def pz_take(self):
+        if self._pz is None:
+            return
+        if self._raw_last is None:
+            QtWidgets.QMessageBox.information(self, "Experiment", "No frame yet: start the live stream.")
+            return
+        frame, positions = self._raw_last, self._pz_positions()
+        path = self._pz.add(positions, frame, exposure_us=self.cam.exposure_us, gain_db=self.cam.gain_db,
+                            aoi=dict(self._aoi), analysis_region=self._pz_region())
+        peak = self._region_peak(frame)
+        warn = ""
+        if peak >= 0.99 * self.cam.max_value:
+            warn = "<br><span style='color: red'>Saturated in the region: lower the exposure and take it again.</span>"
+        elif peak < 20:
+            warn = ("<br><span style='color: red'>Only {:.0f} counts in the region: is the PSF inside the orange "
+                    "square?</span>".format(peak))
+        self._pz_buttons(True)
+        self._pz_say(f"Snapshot {len(self._pz)} saved at {self._pz_where(positions)}: {path.name} "
+                     f"(region peak {peak:.0f} counts).{warn}<br>Type the next positions and take the next "
+                     f"snapshot; take a background (PSF light blocked) before finishing.")
+
+    def pz_drop_last(self):
+        if self._pz is None:
+            return
+        entry = self._pz.drop_last()
+        self._pz_buttons(True)
+        self._pz_say(f"Dropped {entry['file'] if entry else 'nothing'}.")
+
+    def pz_background(self) -> bool:
+        """Save the current raw frame as the background for the current exposure and gain."""
+        if self._pz is None or self._raw_last is None:
+            return False
+        frame = self._raw_last
+        path = self._pz.add_background(frame, exposure_us=self.cam.exposure_us, gain_db=self.cam.gain_db,
+                                       aoi=dict(self._aoi))
+        peak = self._region_peak(frame)
+        snaps = [e for e in self._pz.meta["snapshots"] if e.get("peak")]
+        warn = ""
+        if snaps and peak > 0.3 * max(e["peak"] for e in snaps):
+            warn = ("<br><span style='color: red'>The region still has {:.0f} counts: was the PSF light blocked? "
+                    "Take the background again if not.</span>".format(peak))
+        missing = self._pz.missing_backgrounds()
+        self._pz_say(f"Background saved: {path.name} (region peak {peak:.0f} counts).{warn}"
+                     + (f"<br>Still missing a background for: "
+                        + ", ".join(f"{e:.0f} µs / {g:g} dB" for e, g in missing) if missing else ""))
+        return True
+
+    def pz_finish(self):
+        """Finish: make sure every exposure / gain used has a background, then analyse."""
+        if self._pz is None:
+            return
+        while self._pz.missing_backgrounds():
+            exposure, gain = self._pz.missing_backgrounds()[0]
+            box = QtWidgets.QMessageBox(self)
+            box.setWindowTitle("Background missing")
+            box.setText(f"No background yet for {exposure:.0f} µs / {gain:g} dB.\n\nBlock the PSF light, wait for "
+                        f"the image to update, then take it. The camera is now at {self.cam.exposure_us:.0f} µs / "
+                        f"{self.cam.gain_db:g} dB.")
+            take = box.addButton("Take background now", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+            skip = box.addButton("Finish without", QtWidgets.QMessageBox.ButtonRole.DestructiveRole)
+            box.addButton("Back to the experiment", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is take:
+                if not (np.isclose(self.cam.exposure_us, exposure, rtol=1e-3) and np.isclose(self.cam.gain_db, gain)):
+                    QtWidgets.QMessageBox.information(self, "Background", f"Set the camera to {exposure:.0f} µs and "
+                                                      f"{gain:g} dB first, then finish again.")
+                    return
+                self.pz_background()
+            elif box.clickedButton() is skip:
+                break
+            else:
+                return
+        scan, self._pz = self._pz, None
+        folder = scan.finish()
+        self._pz_buttons(False)
+        self.pz_btn_take.setText("Take snapshot")
+        self.pz_status.setText(f"Finished: {len(scan)} snapshots, {len(scan.backgrounds)} background(s) in {folder}")
+        if self.pz_run.isChecked() and len(scan):
+            self.scan_analyse(folder, self.pz_analysis.currentText())
+
+    def pz_cancel(self):
+        if self._pz is None:
+            return
+        scan, self._pz = self._pz, None
+        self._pz_buttons(False)
+        self.pz_btn_take.setText("Take snapshot")
+        self.pz_status.setText(f"Cancelled; the {len(scan)} snapshots stay in {scan.folder.name}.")
+
+    def pz_analyse_folder(self):
+        start = latest_scan(self.data_root, "experiment_data") or (self.data_root / "experiment_data")
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Experiment folder (contains scan.json)", str(start))
+        if folder:
+            self.scan_analyse(Path(folder), self.pz_analysis.currentText())
 
     def show_figure(self, fig, title: str):
         """A matplotlib figure in its own (non-blocking) window with the usual toolbar."""
