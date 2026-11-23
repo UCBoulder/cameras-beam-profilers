@@ -36,6 +36,10 @@ import vmbpy as vpy
 import matplotlib.pyplot as plt
 from vmbpy import AccessMode
 
+# vmbpy's errors share only a private base class
+VMB_ERRORS = (vpy.VmbCameraError, vpy.VmbFeatureError, vpy.VmbFrameError, vpy.VmbSystemError,
+              vpy.VmbTransportLayerError, vpy.VmbTimeout)
+
 
 class AlviumG1:
     """
@@ -143,18 +147,29 @@ class AlviumG1:
 
     # ---------- Camera connection ----------
 
+    # GigE cameras (Mako) appear in Vimba's list only once its discovery has run, ~3 s after start
+    _DISCOVERY_S = 6.0
+
+    def _wait_for_cameras(self) -> list:
+        """Real cameras (Vimba X Camera Simulator skipped), the wanted one if camera_id is set,
+        waiting up to _DISCOVERY_S for GigE discovery."""
+        deadline = time.monotonic() + self._DISCOVERY_S
+        while True:
+            cams = [c for c in self.vmb.get_all_cameras() if "Simulator" not in c.get_interface_id()]
+            if self.camera_id is not None:
+                cams = [c for c in cams if c.get_id() == self.camera_id]
+            if cams or time.monotonic() > deadline:
+                return cams
+            time.sleep(0.25)
+
     def _connect_camera(self):
         """
         Connect to the Allied Vision camera.
         """
+        cams = self._wait_for_cameras()
         if self.camera_id is not None:
-            self.cam = self.vmb.get_camera_by_id(self.camera_id)
+            self.cam = cams[0] if cams else self.vmb.get_camera_by_id(self.camera_id)
         else:
-            # Ignore the fake cameras from the Vimba X Camera Simulator
-            cams = [
-                c for c in self.vmb.get_all_cameras()
-                if "Simulator" not in c.get_interface_id()
-            ]
             if not cams:
                 raise RuntimeError(
                     "No Allied Vision cameras found. Check the camera is plugged in "
@@ -168,6 +183,7 @@ class AlviumG1:
         try:
             self.set_access_mode("Full")
             self.cam._open()  # explicit, once
+            self._opened = True
         except vpy.VmbCameraError as exc:
             raise RuntimeError(
                 f"[Camera] Could not open '{self.camera_id}' in Full access mode.\n"
@@ -190,6 +206,12 @@ class AlviumG1:
         else:
             self._uncrop_camera()
 
+    # Bandwidth with standard 1500-byte packets when the config gives none. The camera's full 115 MB/s
+    # is then ~77 000 packets/s, more than a USB-to-Ethernet adapter receives: a Mako G-131B behind a
+    # Realtek USB GbE lost 28 % of the packets at 115 MB/s and 11 % at 70 MB/s (no complete frame),
+    # none at 40 MB/s (14 fps of 12-bit full frames). Jumbo packets need ~5x fewer and keep the full rate.
+    _BANDWIDTH_STANDARD_PACKETS = 40e6
+
     def _set_packet_size(self):
         """
         GigE cameras (Mako): the network packet size must fit the link. A camera
@@ -197,6 +219,12 @@ class AlviumG1:
         unconfigured switch delivers only incomplete frames. Uses the config key
         "packet_size" (bytes) when given, else lets Vimba negotiate the largest
         size the link carries (GVSPAdjustPacketSize), else falls back to 1500.
+
+        The config key "stream_bytes_per_second" caps the camera's bandwidth
+        (StreamBytesPerSecond, clipped to its range). A lower rate spaces the
+        packets out, for a host that loses them in bursts although each one fits
+        the link (USB-to-Ethernet adapters). None: _BANDWIDTH_STANDARD_PACKETS
+        with standard 1500-byte packets, the camera's own setting with jumbo packets.
         """
         if (size := self._optional("GevSCPSPacketSize")) is None:
             return                                   # not a GigE camera
@@ -207,23 +235,82 @@ class AlviumG1:
                 stream.GVSPAdjustPacketSize.run()
                 while not stream.GVSPAdjustPacketSize.is_done():
                     time.sleep(0.01)
-            except (vpy.VmbError, AttributeError, IndexError):
+            except (*VMB_ERRORS, AttributeError, IndexError):
                 wanted = 1500
         if wanted is not None:
             size.set(int(wanted))
-        print(f"[Camera] GigE packet size: {size.get()} bytes")
+        bandwidth = self._optional("StreamBytesPerSecond")
+        rate = self._cfg.get("stream_bytes_per_second")
+        if rate is None and size.get() <= 1500:
+            rate = self._BANDWIDTH_STANDARD_PACKETS
+        if rate is not None and bandwidth is not None:
+            lo, hi = bandwidth.get_range()
+            bandwidth.set(int(min(max(rate, lo), hi)))
+        print(f"[Camera] GigE packet size: {size.get()} bytes"
+              + (f", bandwidth {bandwidth.get() / 1e6:.0f} MB/s" if bandwidth is not None else ""))
+
+    # Vimba's GigE stream: receive driver (Filter or Socket) and packet/frame counters since the stream opened
+    _STREAM_REPORT = ("GevSCPSPacketSize", "StreamBytesPerSecond", "PayloadSize", "GVSPDriver",
+                      "StatPacketReceived", "StatPacketMissed", "StatPacketResent", "StatPacketUnavailable",
+                      "StatFrameDelivered", "StatFrameDropped", "StatFrameUnderrun")
+
+    def stream_report(self) -> str:
+        """Stream settings and Vimba's packet counters (GigE), to tell why frames arrive broken."""
+        try:
+            owners = [self.cam.get_streams()[0], self.cam]
+        except (*VMB_ERRORS, AttributeError, IndexError):
+            owners = [self.cam]
+        parts = []
+        for name in self._STREAM_REPORT:
+            for owner in owners:
+                try:
+                    parts.append(f"{name} {owner.get_feature_by_name(name).get()}")
+                    break
+                except (*VMB_ERRORS, AttributeError):
+                    pass
+        return ", ".join(parts) or "no stream features"
+
+    def _broken_frames_message(self, broken: dict, complete: int) -> str:
+        """What arrived broken (frame status -> count), the stream report, and what to change."""
+        n = sum(broken.values())
+        msg = (f"[Camera] {n} of {n + complete} frames arrived broken "
+               f"({', '.join(f'{status} {k}' for status, k in broken.items())}).\n  {self.stream_report()}")
+        if "Incomplete" in broken:
+            msg += ("\n  Incomplete: packets were lost between the camera and Vimba. Lower the bandwidth "
+                    "(config 'stream_bytes_per_second', e.g. 25e6) or enable jumbo frames on the network "
+                    "adapter; 'packet_size': 1500 only helps if the packet size above is larger.")
+        if "TooSmall" in broken:
+            msg += "\n  TooSmall: the frame is larger than its buffer. Try config 'pixel_format': 'Mono8'."
+        return msg
+
+    def reconnect(self):
+        """
+        Open the camera again after its connection was lost, keeping Vimba running. A GigE camera
+        drops its host when the heartbeat stops, e.g. while Windows Modern Standby suspends this
+        process (screen locked). Applies the config settings as at start; the caller restores what
+        it changed since (exposure, gain, readout region) and restarts live mode. Raises
+        RuntimeError while the camera is not back yet.
+        """
+        self._live = False
+        for step in (self.cam.stop_streaming, self.cam._close):   # best effort: the old link may be dead
+            try:
+                step()
+            except Exception:
+                pass
+        self._opened = False
+        self._connect_camera()          # waits for the camera to be discovered again
+        self._apply_initial_settings()
 
     def close(self):
         try:
-            if hasattr(self, "cam"):
-                try:
-                    self.stop_live()
-                except vpy.VmbError:
-                    pass
-                try:
-                    self.cam.set_pixel_format(vpy.PixelFormat.Mono8)
-                except vpy.VmbError:
-                    pass
+            if getattr(self, "_opened", False):
+                # best effort: a failed stop (e.g. Vimba's low-level VmbCError) must not keep the camera
+                # open, or a GigE camera stays locked until its heartbeat times out
+                for step in (self.stop_live, lambda: self.cam.set_pixel_format(vpy.PixelFormat.Mono8)):
+                    try:
+                        step()
+                    except Exception as err:
+                        print(f"[Camera] while closing: {type(err).__name__} {err}")
                 self.cam._close()
         finally:
             if hasattr(self, "_vmb_ctx"):
@@ -491,8 +578,8 @@ class AlviumG1:
 
         frame = self.cam.get_frame(timeout_ms=2000)
         if frame.get_status() != vpy.FrameStatus.Complete:
-            raise RuntimeError(f"[Camera] Frame arrived {frame.get_status().name}: the network drops packets. "
-                               f"Lower the packet size (config 'packet_size': 1500) or fix the link.")
+            self.cam.AcquisitionMode.set(prev_mode)
+            raise RuntimeError(self._broken_frames_message({frame.get_status().name: 1}, 0))
         if frame.get_pixel_format() != self.px_format:
             frame = frame.convert_pixel_format(self.px_format)
 
@@ -510,7 +597,8 @@ class AlviumG1:
         """Stream frames into a one-frame buffer (see grab_latest)."""
         if self._live:
             return
-        self._latest, self._frame_count, self._incomplete, self._t_live = None, 0, 0, time.perf_counter()
+        self._latest, self._frame_count, self._t_live = None, 0, time.perf_counter()
+        self._complete, self._broken, self._reported = 0, {}, False   # since start: complete, status -> count
         self.cam.AcquisitionMode.set("Continuous")
         self.cam.start_streaming(self._on_frame, buffer_count=5)
         self._live = True
@@ -525,28 +613,32 @@ class AlviumG1:
         return self._live
 
     def _on_frame(self, cam, stream, frame):
-        """vmbpy frame handler (runs in a Vimba thread): keep the newest complete frame."""
+        """vmbpy frame handler (runs in a Vimba thread): keep the newest complete frame, count broken ones."""
         try:
-            if frame.get_status() == vpy.FrameStatus.Complete:
+            status = frame.get_status()
+            if status == vpy.FrameStatus.Complete:
                 converted = frame if frame.get_pixel_format() == self.px_format \
                     else frame.convert_pixel_format(self.px_format)
                 img = converted.as_numpy_ndarray()[:, :, 0].astype(np.uint16)   # copies out of the buffer
                 with self._lock:
                     self._latest = img
                     self._frame_count += 1
+                    self._complete += 1
             else:
                 with self._lock:
-                    self._incomplete += 1
-                if self._incomplete == 20 and self._frame_count == 0:
-                    print("[Camera] Only incomplete frames arrive: the network drops packets. "
-                          "Lower the packet size (config 'packet_size': 1500) or fix the link.")
+                    self._broken[status.name] = self._broken.get(status.name, 0) + 1
         finally:
             cam.queue_frame(frame)
 
     def grab_latest(self) -> np.ndarray | None:
-        """The newest frame since the previous call, or None."""
+        """The newest frame since the previous call, or None. Reports once when 20 frames arrived broken."""
         with self._lock:
             img, self._latest = self._latest, None
+            report = not self._reported and sum(self._broken.values()) >= 20
+            broken, complete = dict(self._broken), self._complete
+        if report:
+            self._reported = True
+            print(self._broken_frames_message(broken, complete))   # here, not in the Vimba thread: reads features
         return img
 
     def frame_rate(self) -> float:
