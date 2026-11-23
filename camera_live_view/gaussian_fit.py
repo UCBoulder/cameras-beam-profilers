@@ -34,8 +34,15 @@ def gaussian_2d(coords, A, x0, y0, wx, wy, theta, B):
     return A * np.exp(-2.0 * (xp ** 2 / wx ** 2 + yp ** 2 / wy ** 2)) + B
 
 
-def find_spot(img: np.ndarray, block: int = 4) -> tuple[int, int]:
-    """(iy, ix) of the brightest pixel inside the brightest `block` × `block` mean."""
+def find_spot(img: np.ndarray, block: int = 4, search: tuple[int, int, int, int] | None = None) -> tuple[int, int]:
+    """
+    (iy, ix) of the brightest pixel inside the brightest `block` × `block` mean;
+    only inside search = (x_min, y_min, x_max, y_max) (array pixels, inclusive) if given.
+    """
+    if search is not None:
+        x0, y0, x1, y1 = search
+        iy, ix = find_spot(img[y0:y1 + 1, x0:x1 + 1], block)
+        return y0 + iy, x0 + ix
     h, w = img.shape
     hb, wb = h // block, w // block
     coarse = img[:hb * block, :wb * block].reshape(hb, block, wb, block).mean(axis=(1, 3))
@@ -100,12 +107,17 @@ def _significant(fit: dict) -> bool:
     return fit["amplitude"] >= 5.0 * max(fit.get("noise", 0.0), 0.5)
 
 
-def fit_gaussian_2d(frame: np.ndarray, half_size: int | None = 30, max_pixels: int = MAX_PIXELS) -> dict:
+def fit_gaussian_2d(frame: np.ndarray, half_size: int | None = 30, max_pixels: int = MAX_PIXELS,
+                    search: tuple[int, int, int, int] | None = None) -> dict:
     """
     Fit gaussian_2d() to the spot around the brightest pixel of `frame`, in a
     window of ±half_size pixels, or the whole frame with half_size=None. In the
     whole-frame case the centre may lie outside the frame (a beam larger than
     the sensor, centred off the chip); fit["outside"] says so.
+
+    search = (x_min, y_min, x_max, y_max) (array pixels, inclusive) looks for the
+    spot only there, so a brighter feature elsewhere is not picked; the fit
+    window around the spot keeps its size and may reach beyond it.
 
     Returns a dict with x0, y0, wx, wy, theta, amplitude, offset, peak (A + B),
     window (x_min, y_min, x_max, y_max), binning (b, 1 = unbinned) and outside;
@@ -114,14 +126,14 @@ def fit_gaussian_2d(frame: np.ndarray, half_size: int | None = 30, max_pixels: i
     "fit" the noise).
     """
     img = np.asarray(frame, dtype=float)
-    iy, ix = find_spot(img)
+    iy, ix = find_spot(img, search=search)
     full = half_size is None
     half = max(img.shape) if full else half_size
     for attempt in range(4):
         fit = fit_window(img, ix, iy, half, max_pixels, centre_margin=1.0 if full and attempt == 0 else 0.0)
         if fit["binning"] > 1 and not _significant(fit):
             # binning averaged a small spot away: look again, unbinned, around the brightest pixel
-            iy, ix = find_spot(img)
+            iy, ix = find_spot(img, search=search)
             half = max(int(np.sqrt(max_pixels) / 2) - 1, 5)
             continue
         w_max = max(fit["wx"], fit["wy"])
