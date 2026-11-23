@@ -1,23 +1,24 @@
 # Examples
 
-One snapshot script per camera, all with the same layout (a `CONFIG` dict at the top),
-and a live viewer. Run them from the repo root after `pip install -r requirements.txt`.
+A snapshot script and a live viewer, both with a `CONFIG` dict at the top; the camera is
+picked by name (`cameras.py`, which also holds the Allied Vision settings). Run them from the repo root after `pip install -r requirements.txt`.
 
 ## Camera types
 
 | Camera | Package / class | Driver to install (not pip) | Snapshot | Live view |
 |---|---|---|---|---|
-| **Cinogy CinCam CMOS 1201** beam profiler, via the Thorlabs uc480 driver *(recommended for the CinCam)* | `cinogy_uc480.CinCamUC480` | Thorlabs uc480 driver: install the free ThorCam software (thorlabs.com). No RayCi. | `snapshot_cincam_uc480.py` | `live_view.py` |
-| Cinogy CinCam CMOS 1201, via the IDS uEye API | `cinogy.CinCamCMOS1201` | CINOGY / RayCi install (`ueye_api_64.dll`), plus `pip install -e ".[ueye]"` | `snapshot_cincam.py` | – |
-| Allied Vision Alvium G1 / Mako G-131B | `allied_vision.AlviumG1` | [Vimba X SDK](https://www.alliedvision.com/en/products/software/vimba-x-sdk/) (see the main README) | `snapshot_alvium.py` | `live_view.py alvium` |
+| **Cinogy CinCam CMOS 1201** beam profiler, via the Thorlabs uc480 driver *(recommended for the CinCam)* | `cinogy_uc480.CinCamUC480` | Thorlabs uc480 driver: install the free ThorCam software (thorlabs.com). No RayCi. | `snapshot.py` | `live_view.py` |
+| Cinogy CinCam CMOS 1201, via the IDS uEye API | `cinogy.CinCamCMOS1201` | CINOGY / RayCi install (`ueye_api_64.dll`), plus `pip install -e ".[ueye]"` | `snapshot.py cincam_ueye` | – |
+| Allied Vision Alvium G1 / Mako G-131B | `allied_vision.AlviumG1` | [Vimba X SDK](https://www.alliedvision.com/en/products/software/vimba-x-sdk/) (see the main README) | `snapshot.py alvium` | `live_view.py alvium` |
+| Thorlabs Zelux CS165MU1 | `thorlabs_zelux.ThorlabsZelux` | ThorImageCAM or ThorCam from thorlabs.com (brings `thorlabs_tsi_camera_sdk.dll`) | `snapshot.py zelux` | `live_view.py zelux` |
 
 The CinCam is an IDS uEye UI-154xLE-M inside (1280 × 1024, 5.2 µm pixels, 8-bit). Both
 CinCam packages talk to the same camera through the same uEye C API; they differ only in
 which vendor driver owns it. The uc480 one needs nothing but the free Thorlabs driver.
 
-The live viewer is camera-independent: `python examples/live_view.py cincam` (default) or
+The live viewer is camera-independent: `python examples/live_view.py cincam` (default),
 `python examples/live_view.py alvium` for an Allied Vision camera over Vimba X (Alvium,
-Mako over GigE). Any camera class with the small live interface (start_live / stop_live /
+Mako over GigE), or `python examples/live_view.py zelux`. Any camera class with the small live interface (start_live / stop_live /
 grab_latest, exposure, gain, readout region, snapshot) can be plugged in the same way.
 
 ## CinCam in three steps
@@ -25,29 +26,45 @@ grab_latest, exposure, gain, readout region, snapshot) can be plugged in the sam
 1. Install **ThorCam** from Thorlabs (it brings the uc480 driver). In Device Manager the
    camera then shows as *uc480 cmos, 1280x1024*.
 2. `pip install -r requirements.txt` in this repo.
-3. `python examples/live_view.py` (or `python examples/snapshot_cincam_uc480.py`).
+3. `python examples/live_view.py` (or `python examples/snapshot.py`).
 
 The driver DLL is found on its own (ThorCam and Thorlabs Wavefront Sensor install folders,
 PATH); otherwise set `CINCAM_UC480_DLL` to the full path of `uc480_64.dll`.
 
+## Zelux
+
+The CS165MU1 is a 1440 × 1080 global-shutter mono sensor (Sony IMX273, 3.45 µm pixels,
+10-bit, 0–48 dB gain, exposure 40 µs to 26 s): 35 fps full frame on USB 3, 138 fps on a
+320 × 240 readout region. The region snaps to the sensor's steps (minimum 80 × 12 px);
+read `cam.aoi` for what was set. The SDK DLL is found in the ThorImageCAM and ThorCam
+install folders; otherwise set `THORLABS_TSI_SDK_DLL` to the full path of
+`thorlabs_tsi_camera_sdk.dll`. Pick a camera by serial number with `"camera_id": "39882"`
+when several are plugged in. A snapshot takes ~0.3 s (the camera is armed for each one).
+
 ## Notes
 
-- **One program per camera.** Close RayCi, ThorCam or Vimba X Viewer before running a
-  script; a crashed script can also keep the camera until its Python process ends.
+- **One program per camera.** Close RayCi, ThorCam, ThorImageCAM or Vimba X Viewer before
+  running a script; a crashed script can also keep the camera until its Python process ends.
 - **Mako over GigE:** the packet size must fit the link. The driver lets Vimba negotiate
   it at connection; if frames still arrive incomplete (typical behind a USB-to-Ethernet
-  adapter, which drops jumbo packets) set `"packet_size": 1500` in the config. Incomplete
-  frames are reported as an error, never saved.
+  adapter, which drops jumbo packets) set `"packet_size": 1500` in the config. Broken
+  frames are never saved: after 20 of them the driver prints their status, the packet size,
+  bandwidth and Vimba's packet counters. If packets are lost although they fit the link,
+  cap the bandwidth (`"stream_bytes_per_second": 40e6`) or enable jumbo frames on the
+  adapter, which cuts the packet rate about six-fold.
 - Every camera writes the same folders, `data/<experiment>/snapshot_<timestamp>/` with
-  `data_*.npy` (raw frame, uint16), `preview_*.png` and `metadata_*.json`. `data/` is
-  ignored by git.
+  `data_*.npy` (raw frame, uint16), `preview_*.png` and `metadata_*.json`, under
+  `DATA_ROOT` set in `examples/cameras.py` (the Objective-testing `data` folder, or this
+  repo's `data/` on a PC without it; `data/` is ignored by git).
 - `aoi` in `CONFIG` reads out only a rectangle of the sensor (faster, smaller files); the
   rectangle is recorded in the metadata.
-- Live view layout: the settings column is a dock. Drag the separator to widen it, drag
-  its title bar out (or double-click it) to make it a window of its own, drop it on the
-  right, or hide it with the "Settings" toolbar button to give the image the whole
-  screen. It scrolls when taller than the screen. The window remembers its size, position
-  and dock layout between runs; "Reset layout" puts everything back (dock on the left,
+- Live view layout: Settings and Alignment are two docks sharing tabs at the top of the
+  left column (the tab is the only label while they are tabbed). Drag the separator to
+  widen them, drag a tab out to make that dock a window of its own (a dock on its own
+  has a title bar again: drag it or double-click it to dock it back), drop it on the
+  right, or hide it with its toolbar button to give the image the whole screen. Each
+  scrolls when taller than the screen. The window remembers its size, position and dock
+  layout between runs; "Reset layout" puts everything back (both tabbed on the left,
   window maximised).
 - Live view "Alignment" dock (tab next to Settings; drag it out for its own window): the
   **focal plane scan**. Enter a name, the start position and the step (typed in mm, inch
@@ -67,12 +84,35 @@ PATH); otherwise set `CINCAM_UC480_DLL` to the full path of `uc480_64.dll`.
   and it appears in the dock's menu.
 - Live view "Alignment" dock, **PSF vs target and camera position**: place the orange
   analysis square on the PSF ("Centre region on the current fit", or drag it), start, then
-  for every shot type the target z and camera z and take a snapshot; take a background with
-  the PSF light blocked (one per exposure and gain used; finishing asks for any missing).
-  Frames go to `data/experiment_data/<name>_<time>/` with `scan.json` (both positions, the
-  analysis region, exposure, gain and readout region per shot). The analysis is plugged in
-  by the program that starts the viewer: Objective-testing's `scripts/live_view.py` adds
-  the Strehl-ratio map, which runs when the experiment is finished.
+  for every shot type the target z and camera z (each with its own unit: mm, inch or µm;
+  saved in mm) and take a snapshot; take a background with the PSF light blocked (one per
+  exposure and gain used; finishing asks for any missing). Frames go to
+  `data/experiment_data/<name>_<time>/` with `scan.json` (both positions, the analysis
+  region, exposure, gain and readout region per shot), and a PNG of every frame (the raw
+  frame with its colour bar, in the log or linear scale shown on screen, positions and
+  exposure in the title) in `PNG/` under the same name. Its analyses are listed apart from
+  the focal-plane scan's (`scan_analysis.PSF_POSITION_ANALYSES`) and plugged in by the
+  program that starts the viewer: Objective-testing's `scripts/live_view.py` adds NA,
+  Strehl ratio and Zernikes vs position (three figures), which runs when the experiment
+  is finished. An analysis may return one figure or a list of them. Started from
+  `examples/live_view.py` the menu says "none registered".
+- Live view "Alignment" dock, **power-meter scan**: where on the camera is the power behind
+  an aperture / fibre highest? Needs Thorlabs' Optical Power Monitor software (its TLPM
+  driver; close the OPM application itself). "Find", "Connect", choose x or y, start, and
+  move the beam slowly across: every Gaussian fit of the spot adds a point (fit centre,
+  power averaged over that frame's exposure) to the live plot, with a Gaussian on an
+  offset refitted as points come in. "Reset data" drops the points so far, "Reset fit"
+  forgets the fit of the axis on the plot and its remembered maximum. "Stop, fit and
+  save" fits once more and saves, only then, `<folder>/<name>_<axis>_<time>/` with
+  `scan.json` (camera and meter metadata, the fit), `power_scan.csv` (one row per point)
+  and `power_vs_<axis>.png`; the folder is chosen in the dock. After an x and a y scan
+  the viewer asks whether to mark (x0, y0) as a reference point.
+  `camera_live_view.power_scan.load_power_scan(folder)` reads a scan back. Any meter
+  object with `power_w()` and `close()` can be passed instead:
+  `run_live_view(cam, ..., power_meter=meter)`.
+- The highest count in the orange analysis square is written above it in large white
+  letters with a black edge, readable on every colour of the scale; magenta with
+  "SATURATED" when the raw frame clips in the square.
 - Live view mouse: wheel zooms, right-drag pans, left-drag moves or resizes the yellow
   readout rectangle. The save button stores the raw frame even when background
   subtraction is shown, and records the background file in the metadata.

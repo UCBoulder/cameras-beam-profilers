@@ -4,7 +4,8 @@
 # Installs this repo (editable) with its dependencies from pyproject.toml:
 # vmbpy, numpy, matplotlib, and the live viewer (pyqtgraph, PySide6-Essentials).
 # The camera drivers are not pip packages: Thorlabs uc480 driver (ThorCam) for the
-# CinCam, Vimba X SDK for Allied Vision cameras. See examples/README.md.
+# CinCam, Vimba X SDK for Allied Vision cameras, ThorImageCAM or ThorCam for the
+# Thorlabs Zelux. See examples/README.md.
 -e .[live]
 
 # CinCam through the CINOGY / RayCi driver (examples/snapshot_cincam.py) also needs

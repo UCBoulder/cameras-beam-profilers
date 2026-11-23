@@ -12,8 +12,9 @@ One canonical camera layer for the yb2 lab — pull it into any project as a git
 |---|---|---|---|
 | `cinogy_uc480` | Cinogy CinCam CMOS 1201 beam profiler, with a live mode | Thorlabs uc480 driver (free ThorCam). No RayCi, no pyueye. | [cinogy_uc480/README.md](cinogy_uc480/README.md) |
 | `cinogy` | Cinogy CinCam CMOS 1201 | CINOGY / RayCi install, `pip install -e ".[ueye]"` | [cinogy/README.md](cinogy/README.md) |
-| `allied_vision` | Allied Vision Alvium G1, Mako G-131B | Vimba X SDK | this README |
-| `camera_live_view` | Live viewer for `cinogy_uc480` (pyqtgraph) | – | [examples/README.md](examples/README.md) |
+| `allied_vision` | Allied Vision Alvium G1, Mako G-131B / G-319B | Vimba X SDK | this README |
+| `thorlabs_zelux` | Thorlabs Zelux CS165MU1, with a live mode | ThorImageCAM or ThorCam (brings the camera SDK DLL). No Thorlabs Python package. | [examples/README.md](examples/README.md) |
+| `camera_live_view` | Live viewer for any camera above with a live mode (pyqtgraph) | – | [examples/README.md](examples/README.md) |
 
 One example script per camera, and the live viewer, are in [examples/](examples/README.md).
 
@@ -26,7 +27,7 @@ One example script per camera, and the live viewer, are in [examples/](examples/
    cd cameras-beam-profilers
    pip install -r requirements.txt
    ```
-3. Close RayCi / ThorCam, then `python examples/live_view.py` or `python examples/snapshot_cincam_uc480.py`.
+3. Close RayCi / ThorCam, then `python examples/live_view.py` or `python examples/snapshot.py`.
 
 ---
 

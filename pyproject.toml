@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cameras-beam-profilers"
 version = "0.2.0"
-description = "Snapshot-oriented camera wrappers for the yb2 lab: Allied Vision (vmbpy) and Cinogy CinCam (uc480 / uEye), plus a live viewer"
+description = "Snapshot-oriented camera wrappers for the yb2 lab: Allied Vision (vmbpy), Cinogy CinCam (uc480 / uEye) and Thorlabs Zelux (TSI SDK), plus a live viewer"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -30,4 +30,4 @@ ueye = [               # cinogy.CinCamCMOS1201 (CinCam through the CINOGY / RayC
 Repository = "https://github.com/UCBoulder/cameras-beam-profilers"
 
 [tool.setuptools]
-packages = ["allied_vision", "cinogy", "cinogy_uc480", "camera_live_view"]
+packages = ["allied_vision", "cinogy", "cinogy_uc480", "thorlabs_zelux", "thorlabs_power_meter", "camera_live_view"]

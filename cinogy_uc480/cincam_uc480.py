@@ -849,7 +849,7 @@ class CinCamUC480:
 
 if __name__ == "__main__":
     # Quick check that the camera answers: connect, grab one frame, report, close.
-    # Real use goes through the examples (examples/live_view.py, examples/snapshot_cincam_uc480.py).
+    # Real use goes through the examples (examples/live_view.py, examples/snapshot.py).
     cam = CinCamUC480({"data_root": Path.cwd() / "data"})
     try:
         img = cam.capture_frame()

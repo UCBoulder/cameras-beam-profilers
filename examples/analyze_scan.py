@@ -13,10 +13,11 @@ import matplotlib.pyplot as plt
 
 from camera_live_view.position_scan import latest_scan
 from camera_live_view.scan_analysis import ANALYSES
+from cameras import DATA_ROOT
 
 CONFIG = {
     "folder": None,          # a scan folder, or None for the most recent one under data_root/alignment_data
-    "data_root": Path(__file__).resolve().parents[1] / "data",
+    "data_root": DATA_ROOT,
     "analysis": "Gaussian waist vs position (parabola focus)",
     "position_scale": 1.0,   # multiplies the recorded positions: 25.4 if the steps were typed in mm
                              # but the stage moved in inches (0.1 "mm" -> 0.1 inch = 2.54 mm)
