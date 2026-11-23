@@ -1,8 +1,9 @@
 """
 Camera visualization helpers for PSF analysis.
 
-save_psf_2d  — 2-D plot: beam-profiler colours on a logarithmic scale fixed
-    to 0–max_value (white = saturated), the same scale as the live view.
+save_psf_2d  — 2-D plot: beam-profiler colours on a logarithmic (or linear)
+    scale fixed to 0–max_value (white = saturated), the same scale as the live
+    view. Built without pyplot, so it can run in a worker thread.
 
 save_psf_3d  — 3-D surface plot, Blues fixed to 0–max_value.
 
@@ -21,6 +22,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+from matplotlib.figure import Figure
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 – registers the 3D projection
 
 
@@ -61,6 +63,7 @@ def save_psf_2d(
     save_path: Path,
     title: str = "",
     max_value: int = UINT12_MAX,
+    log: bool = True,
 ) -> None:
     """
     Save the frame as a PNG: one panel in the beam-profiler colours on a
@@ -77,21 +80,24 @@ def save_psf_2d(
         Optional title; the peak value (and a saturation warning) is added below it.
     max_value : int
         Full-scale value (default 4095, i.e. Mono12).
+    log : bool
+        Logarithmic colour scale (default); False = linear.
     """
     img_max = int(img.max())
     h_px, w_px = img.shape
     panel_h = 5.0                                              # inches
     fig_w = min(max(w_px / h_px * panel_h, 3.0) + 1.5, 16.0)  # + colorbar, capped
 
-    fig, ax = plt.subplots(figsize=(fig_w, panel_h + 0.8), constrained_layout=True)
-    im = ax.imshow(
-        img, cmap=BEAM_CMAP, norm=mcolors.FuncNorm((np.log1p, np.expm1), vmin=0, vmax=max_value),
-        origin="upper", interpolation="nearest",
-    )
+    fig = Figure(figsize=(fig_w, panel_h + 0.8), layout="constrained")   # no pyplot: thread-safe
+    ax = fig.add_subplot()
+    norm = (mcolors.FuncNorm((np.log1p, np.expm1), vmin=0, vmax=max_value) if log
+            else mcolors.Normalize(vmin=0, vmax=max_value))
+    im = ax.imshow(img, cmap=BEAM_CMAP, norm=norm, origin="upper", interpolation="nearest")
     cbar = fig.colorbar(im, ax=ax, fraction=0.04, pad=0.03)
-    cbar.set_ticks([t for t in (0, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000) if t < max_value]
-                   + [max_value])
-    cbar.set_label(_cbar_label(max_value) + ", log scale", fontsize=8)
+    if log:
+        cbar.set_ticks([t for t in (0, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000) if t < max_value]
+                       + [max_value])
+    cbar.set_label(_cbar_label(max_value) + (", log scale" if log else ", linear scale"), fontsize=8)
     cbar.ax.tick_params(labelsize=7)
     ax.set_xlabel("x (pixels)", fontsize=8)
     ax.set_ylabel("y (pixels)", fontsize=8)
@@ -101,7 +107,6 @@ def save_psf_2d(
     ax.set_title(f"{title}\n{peak}" if title else peak, fontsize=9)
 
     fig.savefig(str(save_path), dpi=150, bbox_inches="tight")
-    plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
