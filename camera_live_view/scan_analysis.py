@@ -1,8 +1,10 @@
 """
 Analyses of a position scan (position_scan.py), each a function
-`analysis(folder) -> matplotlib Figure`, listed in ANALYSES so the live
-viewer can run one when a scan is finished and a script can run the same
-one later:
+`analysis(folder) -> matplotlib Figure` (or a list of Figures, each shown in
+its own window), listed in ANALYSES (focal-plane
+scan) or PSF_POSITION_ANALYSES (PSF vs target and camera position) so the
+live viewer offers only the analyses that fit the experiment, runs one when
+it is finished, and a script can run the same one later:
 
     from camera_live_view.scan_analysis import ANALYSES, waist_vs_position
     fig = waist_vs_position("data/alignment_data/focus_scan_2026_10_22-10_15_00")
@@ -153,6 +155,12 @@ def waist_vs_position(folder, fig: Figure | None = None, position_scale: float =
     return fig
 
 
+# Analyses of the focal-plane scan (one position axis)
 ANALYSES = {
     "Gaussian waist vs position (parabola focus)": waist_vs_position,
 }
+
+# Analyses of the "PSF vs target and camera position" experiment (axes target_z, camera_z).
+# None live here: the program that starts the viewer adds them (Objective-testing's
+# scripts/live_view.py adds the Strehl-ratio map).
+PSF_POSITION_ANALYSES = {}

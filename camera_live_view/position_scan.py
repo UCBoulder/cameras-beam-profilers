@@ -16,8 +16,9 @@ folder (scan_analysis.py, your own script) gets positions and frames back.
 
 Folder: <root>/alignment_data/<name>_<YYYY_MM_DD-HH_MM_SS>/ with scan.json
 (name, unit, start, step, camera metadata, one entry per snapshot) and
-data_<position><unit>.npy per snapshot, the position with sign and three
-decimals so the files list in order.
+data_<position><unit>.npy per snapshot, the position with sign and at least
+three decimals (up to six, format_position()), so that sub-µm positions in mm
+get their own files.
 
 Several positions per snapshot (e.g. a target z and a camera z):
 
@@ -38,6 +39,13 @@ from pathlib import Path
 import numpy as np
 
 INDEX = "scan.json"
+POSITION_DECIMALS = 6               # positions are typed and named to 1e-6 of their unit (1 nm in mm)
+
+
+def format_position(value: float) -> str:
+    """'+12.700', '+0.000450': sign, at least three decimals, up to POSITION_DECIMALS (no trailing zeros beyond)."""
+    whole, _, decimals = f"{value:+.{POSITION_DECIMALS}f}".rstrip("0").partition(".")
+    return f"{whole}.{decimals.ljust(3, '0')}"
 
 
 class PositionScan:
@@ -76,8 +84,8 @@ class PositionScan:
     def filename(self, position: float | dict) -> str:
         unit = re.sub(r"[^\w]+", "", self.meta["unit"])     # file-name safe ("inch", "mm", "µm", "steps")
         if isinstance(position, dict):
-            return "data_" + "_".join(f"{axis}{position[axis]:+.3f}{unit}" for axis in self.axes) + ".npy"
-        return f"data_{position:+.3f}{unit}.npy"
+            return "data_" + "_".join(f"{axis}{format_position(position[axis])}{unit}" for axis in self.axes) + ".npy"
+        return f"data_{format_position(position)}{unit}.npy"
 
     @property
     def axes(self) -> list[str]:
