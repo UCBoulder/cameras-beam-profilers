@@ -16,7 +16,9 @@ Works with any camera that has the live interface of cinogy_uc480.CinCamUC480
 (currently the only one): start_live(), stop_live(), live, grab_latest(),
 frame_rate(); set_exposure(), set_gain(), exposure_us, gain_db,
 exposure_range_us(), gain_range_db(); set_aoi(), reset_aoi(), aoi,
-sensor_width, sensor_height, max_value; snapshot() and data_root.
+sensor_width, sensor_height, max_value; snapshot() and data_root. Optional:
+reconnect(), called when frames stop arriving (a GigE camera after the PC's
+standby); the viewer then restores its exposure, gain and readout region.
 
 Data flow
 ---------
@@ -42,12 +44,24 @@ drawn on the image.
 "Alignment" dock (tabbed behind the settings; float it into its own window):
 a focal-plane scan takes raw snapshots at positions the user steps through
 by hand (position_scan.py, data/alignment_data/<name>_<stamp>/) and runs
-the chosen analysis (scan_analysis.ANALYSES) when the scan is finished.
+the chosen analysis (scan_analysis.ANALYSES) when the scan is finished. The
+power-meter scan (power_scan_panel.py) logs the live fit centre against the
+power behind an aperture while the beam is moved across it, along x or y,
+fits a Gaussian on an offset to each and offers (x0, y0) of maximum power as
+a reference point. Any power meter with power_w() and close() works
+(power_scan.py); the panel connects Thorlabs meters itself
+(thorlabs_power_meter), or pass one: run_live_view(cam, ..., power_meter=pm).
+
+The highest count in the analysis region is written above it in white with
+a black outline (magenta when the raw frame saturates there), readable on
+every colour of the scale.
 
 Layout after Allied Vision's viewer: toolbar on top (live on/off, save),
 controls in a dock on the left, image in the middle. Mouse wheel zooms,
-right-drag (or left-drag outside the rectangle) pans; the yellow rectangle is
-the camera's readout region (drag / resize it, then "Apply to camera").
+left- or right-drag pans; the yellow rectangle is the camera's readout region
+(drag its outline to move it, its handles to resize it, then "Apply to
+camera"). The wheel over the settings scrolls them, also over a spin box or
+menu, which takes the wheel only once clicked into.
 """
 
 import json
@@ -55,6 +69,7 @@ import math
 import re
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
 
@@ -63,14 +78,43 @@ import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from .gaussian_fit import fit_gaussian_2d
+from .fit_cuts import OPTICS_FIELDS, FitCutsWindow
 from .dead_pixels import all_bad_pixels, find_dead_pixels, load_dead_pixels, repair, save_dead_pixels
-from .position_scan import PositionScan, latest_scan
-from .scan_analysis import ANALYSES
+from .position_scan import POSITION_DECIMALS, PositionScan, format_position, latest_scan
+from .power_scan_panel import PowerScanPanel
+from .scan_analysis import ANALYSES, PSF_POSITION_ANALYSES
 
 # Beam-profiler colour scale, the same as PSFPlotter.BEAM_CMAP: dark blue ->
 # blue -> cyan -> green -> yellow -> red, white only at saturation
 _BASE_STOPS = [0.0, 0.15, 0.35, 0.5, 0.65, 0.85, 1.0]
 _BASE_COLOURS = [(0, 0, 77), (0, 0, 255), (0, 255, 255), (0, 255, 0), (255, 255, 0), (255, 0, 0), (255, 255, 255)]
+
+
+class OutlinedText(pg.TextItem):
+    """Bold text in a fill colour on a black edge, readable on any colour below it: a copy of the text
+    stroked `edge_px` wide is drawn behind it, so the edge lies outside the letters and the fill stays whole."""
+
+    def __init__(self, anchor=(0.5, 1.0), size_pt: int = 16, edge_px: float = 4.0):
+        super().__init__("", color="w", anchor=anchor)
+        font = self.textItem.font()
+        font.setPointSize(size_pt)
+        font.setBold(True)
+        self.setFont(font)
+        self._edge = QtWidgets.QGraphicsTextItem(self.textItem)
+        self._edge.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemStacksBehindParent)
+        self._edge.setFont(font)
+        self._pen = QtGui.QPen(QtGui.QColor("black"), edge_px, QtCore.Qt.PenStyle.SolidLine,
+                               QtCore.Qt.PenCapStyle.RoundCap, QtCore.Qt.PenJoinStyle.RoundJoin)
+
+    def set_outlined(self, text: str, fill: str = "white"):
+        self.setText(text, color=fill)
+        self._edge.setPlainText(text)
+        cursor = QtGui.QTextCursor(self._edge.document())
+        cursor.select(QtGui.QTextCursor.SelectionType.Document)
+        style = QtGui.QTextCharFormat()
+        style.setForeground(QtGui.QBrush(QtGui.QColor("black")))
+        style.setTextOutline(self._pen)
+        cursor.mergeCharFormat(style)
 
 
 def colour_map(max_value: int, log: bool = True) -> pg.ColorMap:
@@ -81,8 +125,43 @@ def colour_map(max_value: int, log: bool = True) -> pg.ColorMap:
     return pg.ColorMap(u, base.map(pos, mode=pg.ColorMap.BYTE))
 
 
+class _OutlineGrab:
+    """Mixin for an ROI that takes the mouse only on a band EDGE_PX screen pixels wide inside its outline, so a
+    left drag inside it pans the image (the readout rectangle usually covers all of it); drag the outline to
+    move it, its handles to resize it."""
+    EDGE_PX = 8
+
+    def shape(self):
+        r = self.boundingRect()
+        w = min(self.EDGE_PX * (self.pixelLength(QtCore.QPointF(1, 0)) or 0.0), r.width() / 2, r.height() / 2)
+        band, inner = QtGui.QPainterPath(), QtGui.QPainterPath()
+        band.addRect(r)
+        inner.addRect(r.adjusted(w, w, -w, -w))
+        return band.subtracted(inner)
+
+
+class _OutlineROI(_OutlineGrab, pg.ROI):
+    pass
+
+
+class _OutlineRectROI(_OutlineGrab, pg.RectROI):
+    pass
+
+
+class _PanelWheel(QtCore.QObject):
+    """Event filter: the wheel over a spin box, menu or slider of a scrolling panel scrolls the panel instead of
+    changing the value, unless the widget has the keyboard focus (clicked into); over a plot's viewport (never
+    focused) it always scrolls the panel."""
+
+    def eventFilter(self, obj, event):
+        if event.type() == QtCore.QEvent.Type.Wheel and not obj.hasFocus():
+            event.ignore()   # Qt then hands it to the parents, up to the scroll area
+            return True
+        return False
+
+
 class _PanViewBox(pg.ViewBox):
-    """ViewBox where a right-button drag pans (left drag on the ROI moves the ROI instead)."""
+    """ViewBox where a right-button drag pans too (a left drag pans as in any ViewBox)."""
 
     def mouseDragEvent(self, ev, axis=None):
         if ev.button() == QtCore.Qt.MouseButton.RightButton:
@@ -93,6 +172,24 @@ class _PanViewBox(pg.ViewBox):
             self.sigRangeChangedManually.emit(self.state["mouseEnabled"])
         else:
             super().mouseDragEvent(ev, axis)
+
+
+class _PositionSpin(QtWidgets.QDoubleSpinBox):
+    """A typed position: up to POSITION_DECIMALS decimals (0.000001 of the unit), shown without trailing zeros
+    beyond three (12.7 -> 12.700, 0.00045 -> 0.00045)."""
+
+    def __init__(self, low: float = -1e4, high: float = 1e4):
+        super().__init__()
+        self.setDecimals(POSITION_DECIMALS)
+        self.setRange(low, high)
+
+    def textFromValue(self, value: float) -> str:
+        loc = self.locale()
+        text = loc.toString(float(value), "f", self.decimals())
+        if not self.isGroupSeparatorShown():
+            text = text.replace(loc.groupSeparator(), "")
+        whole, point, decimals = text.partition(loc.decimalPoint())
+        return f"{whole}{loc.decimalPoint()}{decimals.rstrip('0').ljust(3, '0')}" if point else text
 
 
 class _ParamControl(QtWidgets.QWidget):
@@ -131,6 +228,9 @@ class _ParamControl(QtWidgets.QWidget):
         self.spin.blockSignals(True)
         self.spin.setValue(value)
         self.spin.blockSignals(False)
+
+    def value(self) -> float:
+        return self.spin.value()
 
     def setValue(self, value: float):
         """Show a value without emitting valueChanged."""
@@ -218,15 +318,20 @@ class LiveView(QtWidgets.QMainWindow):
 
     POLL_MS = 30       # grab_latest() polling period
     PANEL_MIN_WIDTH = 270   # settings column (px); drag the separator to widen it
-    SCAN_UNITS = {"mm": 1.0, "inch": 25.4, "µm": 1e-3}   # input units of the focal-plane scan -> mm
+    SCAN_UNITS = {"mm": 1.0, "cm": 10.0, "inch": 25.4, "µm": 1e-3}   # input units of typed positions -> mm
     STATUS_S = 0.5     # status-bar refresh
+    STALL_S = 5.0      # live, but no frame for this long (+ 3 exposures): the camera link is lost
+    RECONNECT_S = 5.0  # retry period while the camera is not back
     FIT_WINDOWS = (10, 20, 30, 50, 100, 200, 500)   # preset fit half-sizes (px); plus "full frame"
     FIT_PER_SECOND = 10.0   # at most; a fit slower than the interval just delays the next one
     DEAD_PIXEL_FRAMES = 8   # frames averaged by "Find dead pixels"
 
-    def __init__(self, cam, data_root: str | Path, experiment: str = "live view"):
+    def __init__(self, cam, data_root: str | Path, experiment: str = "live view", optics: dict | None = None,
+                 power_meter=None):
         super().__init__()
         self.cam = cam
+        self._power_meter = power_meter   # handed to the power-meter scan panel, which closes it
+        self.optics = optics or {}  # launcher's imaging system (wavelength_nm, na, magnification, …): cut window
         self.data_root = Path(data_root)
         self.experiment = experiment
         self.setWindowTitle(f"Live view — {type(cam).__name__}")
@@ -241,20 +346,32 @@ class LiveView(QtWidgets.QMainWindow):
         self._background_settings = None   # (exposure_us, gain_db) the background was taken with
         self._bg_slice = None       # part of the background covering the current readout
         self._frames, self._t_status = 0, time.perf_counter()
+        self._t_frame, self._next_reconnect = time.perf_counter(), 0.0   # last frame; watchdog retry time
         self._dead = None           # dead pixels and dark spots (dead_pixels.py dict), sensor pixels
         self._dead_path = Path(getattr(cam, "dead_pixel_file", self.data_root / "dead_pixels.json"))
         self._dead_accum = None     # raw frames being averaged for "Find dead pixels"
         self._raw_last = None       # newest raw frame (before background subtraction)
         self._scan = None           # running PositionScan, see _build_alignment
         self._pz = None             # running two-axis PSF experiment (PositionScan with axes)
-        self.pz_roi = None          # its analysis region on the image
+        self.region_roi = None          # its analysis region on the image
         self._figures = []          # analysis windows kept alive
+        self._cuts = None           # window with the x / y cuts through the fit centre (fit_cuts.py)
+        self._png_pool = ThreadPoolExecutor(max_workers=1)   # experiment PNGs, drawn off the GUI thread
+        self._png_jobs = []
 
         self._build_toolbar()
         self._build_controls()
         self._build_alignment()
+        self._wheel_filter = _PanelWheel(self)
+        for dock in (self.dock, self.align_dock):   # the wheel scrolls the panels, not the values in them
+            for kind in (QtWidgets.QAbstractSpinBox, QtWidgets.QComboBox, QtWidgets.QAbstractSlider):
+                for w in dock.widget().findChildren(kind):
+                    w.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)   # no focus from the wheel
+                    w.installEventFilter(self._wheel_filter)
+            for plot in dock.widget().findChildren(pg.PlotWidget):   # e.g. the power scan: auto-scaled, no wheel zoom
+                plot.viewport().installEventFilter(self._wheel_filter)
         self._build_image()
-        self._show_psf_region()
+        self._show_region()
         self.status = QtWidgets.QLabel()
         self.statusBar().addPermanentWidget(self.status, 1)
 
@@ -270,6 +387,7 @@ class LiveView(QtWidgets.QMainWindow):
 
     def _build_toolbar(self):
         bar = self.addToolBar("Main")
+        bar.setObjectName("main")      # needed to save / restore the layout
         bar.setMovable(False)
         bar.setIconSize(QtCore.QSize(24, 24))
         self.act_live = QtGui.QAction(self._icon("SP_MediaPlay"), "Live", self)
@@ -287,6 +405,15 @@ class LiveView(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout(box)
         for w in widgets:
             layout.addWidget(w)
+        return box
+
+    def _unit_box(self, tooltip: str) -> QtWidgets.QComboBox:
+        """Input-unit menu (SCAN_UNITS); its data is the factor to mm."""
+        box = QtWidgets.QComboBox()
+        for unit, to_mm in self.SCAN_UNITS.items():
+            box.addItem(unit, to_mm)
+        box.setMaximumWidth(90)
+        box.setToolTip(tooltip)
         return box
 
     def _build_controls(self):
@@ -323,6 +450,37 @@ class LiveView(QtWidgets.QMainWindow):
         self.show_roi = QtWidgets.QCheckBox("Show rectangle")
         self.show_roi.setChecked(True)
         self.show_roi.toggled.connect(lambda on: self.roi.setVisible(on))
+
+        # Analysis region: the square in which the analyses look for the PSF peak (sensor pixels), saved with
+        # every snapshot and experiment frame; its highest count (raw or background-subtracted) is written above it
+        W, H = self.cam.sensor_width, self.cam.sensor_height
+        store = QtCore.QSettings(*self._settings)
+        self.region_x, self.region_y, self.region_size = QtWidgets.QSpinBox(), QtWidgets.QSpinBox(), QtWidgets.QSpinBox()
+        for spin, maximum, key, default in ((self.region_x, W - 1, "region_x", W // 2),
+                                            (self.region_y, H - 1, "region_y", H // 2),
+                                            (self.region_size, max(W, H), "region_size", 200)):
+            spin.setRange(10 if spin is self.region_size else 0, maximum)
+            spin.setValue(int(store.value(key, default)))     # where it was when the viewer was closed
+            spin.setSuffix(" px")
+            spin.setKeyboardTracking(False)
+            spin.valueChanged.connect(lambda _: self._show_region())
+        region_form = QtWidgets.QFormLayout()
+        region_form.addRow("Centre x", self.region_x)
+        region_form.addRow("Centre y", self.region_y)
+        region_form.addRow("Side", self.region_size)
+        region_widget = QtWidgets.QWidget()
+        region_widget.setLayout(region_form)
+        region_centre = QtWidgets.QPushButton("Centre on the current fit")
+        region_centre.setToolTip("Centre the analysis region on the latest Gaussian centre (or the brightest pixel)")
+        region_centre.clicked.connect(lambda: self.region_centre_on_fit())
+        self.region_show = QtWidgets.QCheckBox("Show the square and its highest count")
+        self.region_show.setChecked(store.value("region_show", "true") in (True, "true"))
+        self.region_show.toggled.connect(lambda _: self._show_region())
+        self.region_bg = QtWidgets.QCheckBox("Highest count with the background subtracted")
+        self.region_bg.setToolTip("Uses the recorded background whether or not the image shows it subtracted. "
+                                  "Magenta still means the raw frame is saturated in the square.")
+        self.region_bg.setChecked(store.value("region_bg", "true") in (True, "true"))
+        self.region_bg.toggled.connect(lambda _: self._show_region_peak())
 
         self.bg_label = QtWidgets.QLabel("none")
         self.bg_label.setStyleSheet("color: gray")
@@ -365,6 +523,12 @@ class LiveView(QtWidgets.QMainWindow):
         self.fit_avg_n.setToolTip("Running average (and standard deviation) of the last N fits")
         self._fit_history = deque(maxlen=10)
         self.fit_avg_n.valueChanged.connect(lambda n: setattr(self, "_fit_history", deque(self._fit_history, maxlen=n)))
+        self.fit_in_region = QtWidgets.QCheckBox("Look for the spot only in the analysis region")
+        self.fit_in_region.setToolTip("The spot to fit is the brightest one inside the orange square (shown or not), "
+                                      "so brighter features elsewhere are ignored. The fit window around it keeps "
+                                      "its size and may reach past the square.")
+        self.fit_in_region.setChecked(store.value("fit_in_region", "false") in (True, "true"))
+        self.fit_in_region.toggled.connect(lambda _: self._fit_history.clear())   # another spot: new average
         self.fit_ellipse = QtWidgets.QCheckBox("Show 1/e² ellipse and axes")
         self.fit_ellipse.setChecked(True)
         for w in (self.fit_units, self.fit_origin):
@@ -378,6 +542,9 @@ class LiveView(QtWidgets.QMainWindow):
         fit_form.addRow("Average over", self.fit_avg_n)
         fit_widget = QtWidgets.QWidget()
         fit_widget.setLayout(fit_form)
+        cuts = QtWidgets.QPushButton("x / y cuts through the fit centre…")
+        cuts.setToolTip("A window with the pixel row and column through the fitted centre, updated with every fit")
+        cuts.clicked.connect(lambda: self.open_cuts())
 
         # dead pixels: found on demand from the lit sensor, kept in a JSON file, ignored in fits
         self.dead_label = QtWidgets.QLabel()
@@ -444,14 +611,17 @@ class LiveView(QtWidgets.QMainWindow):
         layout.addWidget(self._group("Exposure", self.exposure))
         layout.addWidget(self._group("Gain", self.gain))
         layout.addWidget(self._group("Readout region (camera)", roi_widget, apply, full, self.show_roi))
+        layout.addWidget(self._group("Analysis region (orange square, peak search)", region_widget, region_centre,
+                                     self.region_show, self.region_bg))
         layout.addWidget(self._group("Background", self.bg_label, record, load, self.subtract, self.bg_warning))
-        layout.addWidget(self._group("Gaussian fit", self.fit_on, fit_widget, self.fit_ellipse,
+        layout.addWidget(self._group("Gaussian fit", self.fit_on, fit_widget, self.fit_in_region, self.fit_ellipse, cuts,
                                      self.dead_label, find_dead, self.dead_ignore, self.dead_show))
         layout.addWidget(self._group("Reference points", ref_widget))
         layout.addWidget(self._group("Display", self.log_scale))
         layout.addStretch(1)
         # The settings live in a dock: scrollable (never taller than the screen), draggable to the
-        # other side, and floatable into a window of its own (drag its title bar out, or double-click it).
+        # other side, and floatable into a window of its own (drag its tab out; alone, drag or double-click
+        # its title bar).
         scroll = QtWidgets.QScrollArea()
         scroll.setWidget(panel)
         scroll.setWidgetResizable(True)
@@ -473,28 +643,20 @@ class LiveView(QtWidgets.QMainWindow):
         self.toolbar.addSeparator()
         self.act_settings = self.dock.toggleViewAction()
         self.act_settings.setText("Settings")
-        self.act_settings.setToolTip("Show / hide the settings column (drag its title bar out for a separate window)")
+        self.act_settings.setToolTip("Show / hide the settings column (drag its tab out for a separate window)")
         self.toolbar.addAction(self.act_settings)
         act_reset = QtGui.QAction("Reset layout", self)
-        act_reset.setToolTip("Settings docked on the left, window maximised")
+        act_reset.setToolTip("Settings and Alignment tabbed on the left, window maximised")
         act_reset.triggered.connect(self.reset_layout)
         self.toolbar.addAction(act_reset)
 
     def _build_alignment(self):
         """Alignment helpers dock: the focal-plane scan (snapshots at hand-stepped positions + analysis)."""
         self.scan_name = QtWidgets.QLineEdit("focus scan")
-        self.scan_start = QtWidgets.QDoubleSpinBox()
-        self.scan_start.setRange(-1e4, 1e4)
-        self.scan_start.setDecimals(3)
-        self.scan_step = QtWidgets.QDoubleSpinBox()
-        self.scan_step.setRange(-1e3, 1e3)
-        self.scan_step.setDecimals(3)
+        self.scan_start = _PositionSpin()
+        self.scan_step = _PositionSpin(-1e3, 1e3)
         self.scan_step.setValue(0.5)
-        self.scan_unit = QtWidgets.QComboBox()       # input unit only: positions are stored and analysed in mm
-        for unit, to_mm in self.SCAN_UNITS.items():
-            self.scan_unit.addItem(unit, to_mm)
-        self.scan_unit.setMaximumWidth(90)
-        self.scan_unit.setToolTip("Unit of the start position and the step you type; everything is saved in mm")
+        self.scan_unit = self._unit_box("Unit of the start position and the step you type; everything is saved in mm")
         self.scan_analysis = QtWidgets.QComboBox()
         self.scan_analysis.addItems(list(ANALYSES))
         self.scan_analysis.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
@@ -504,9 +666,7 @@ class LiveView(QtWidgets.QMainWindow):
         self.scan_run.setChecked(True)
         form = QtWidgets.QFormLayout()
         # the position of the next snapshot: pre-filled from start + n x step, editable at any time
-        self.scan_pos = QtWidgets.QDoubleSpinBox()
-        self.scan_pos.setRange(-1e4, 1e4)
-        self.scan_pos.setDecimals(3)
+        self.scan_pos = _PositionSpin()
         self.scan_pos.setEnabled(False)
         self.scan_pos.setToolTip("Where the camera is for the next snapshot (input unit). Pre-filled with the last "
                                  "position + the last step taken; type any value for a custom step and the "
@@ -540,58 +700,41 @@ class LiveView(QtWidgets.QMainWindow):
 
 
         # ---- PSF vs target and camera position: two typed positions per snapshot, analysis region, backgrounds ----
-        W, H = self.cam.sensor_width, self.cam.sensor_height
         self.pz_name = QtWidgets.QLineEdit("PSF-target-camera_position dependance")
-        self.pz_unit = QtWidgets.QComboBox()
-        for unit, to_mm in self.SCAN_UNITS.items():
-            self.pz_unit.addItem(unit, to_mm)
-        self.pz_unit.setMaximumWidth(90)
-        self.pz_unit.setToolTip("Unit of the positions you type; everything is saved in mm")
-        self.pz_target, self.pz_camera = QtWidgets.QDoubleSpinBox(), QtWidgets.QDoubleSpinBox()
-        for spin in (self.pz_target, self.pz_camera):
-            spin.setRange(-1e4, 1e4)
-            spin.setDecimals(3)
+        # one position field and one unit per axis (e.g. target in inch, camera in mm); saved in mm. The rail
+        # offset (where the stages sit on the rail) is one value for the whole experiment, saved in scan.json.
+        self.pz_pos, self.pz_units, pz_rows = {}, {}, {}
+        for axis, what, tip in (("target_z", "target (pinhole)", "Where the target is for the next snapshot"),
+                                ("camera_z", "camera", "Where the camera is for the next snapshot"),
+                                ("rail_offset", "rail offset", "Position of the stages on the rail: one value for "
+                                 "the whole experiment, saved in scan.json as rail_offset (mm)")):
+            spin = _PositionSpin()
             spin.setKeyboardTracking(False)
-            spin.valueChanged.connect(lambda _: self._pz_say(self.pz_status.text()))
-        self.pz_target.setToolTip("Where the target (pinhole) is for the next snapshot")
-        self.pz_camera.setToolTip("Where the camera is for the next snapshot")
-        self.pz_rx, self.pz_ry, self.pz_rsize = QtWidgets.QSpinBox(), QtWidgets.QSpinBox(), QtWidgets.QSpinBox()
-        self.pz_rx.setRange(0, W - 1)
-        self.pz_ry.setRange(0, H - 1)
-        self.pz_rsize.setRange(10, max(W, H))
-        self.pz_rx.setValue(W // 2)
-        self.pz_ry.setValue(H // 2)
-        self.pz_rsize.setValue(200)
-        for spin in (self.pz_rx, self.pz_ry, self.pz_rsize):
-            spin.setSuffix(" px")
-            spin.setKeyboardTracking(False)
-            spin.valueChanged.connect(lambda _: self._show_psf_region())
-        region_centre = QtWidgets.QPushButton("Centre region on the current fit")
-        region_centre.setToolTip("Centre the analysis region on the latest Gaussian centre (or the brightest pixel)")
-        region_centre.clicked.connect(lambda: self.pz_centre_on_fit())
-        self.pz_show = QtWidgets.QCheckBox("Show the analysis region (orange square)")
-        self.pz_show.setChecked(True)
-        self.pz_show.toggled.connect(lambda _: self._show_psf_region())
+            spin.setToolTip(tip)
+            unit = self._unit_box(f"Unit of the {what} you type; everything is saved in mm")
+            for signal in (spin.valueChanged, unit.currentIndexChanged):
+                signal.connect(lambda _: self._pz_say(self.pz_status.text()))
+            pz_rows[axis] = QtWidgets.QWidget()
+            row = QtWidgets.QHBoxLayout(pz_rows[axis])
+            row.setContentsMargins(0, 0, 0, 0)
+            row.addWidget(spin, 1)
+            row.addWidget(unit)
+            self.pz_pos[axis], self.pz_units[axis] = spin, unit
+        # only this experiment's analyses (none in this package: the launcher registers them)
         self.pz_analysis = QtWidgets.QComboBox()
-        self.pz_analysis.addItems(list(ANALYSES))
+        self.pz_analysis.addItems(list(PSF_POSITION_ANALYSES) or ["none registered"])
+        self.pz_analysis.setEnabled(bool(PSF_POSITION_ANALYSES))
         self.pz_analysis.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.pz_analysis.setMinimumContentsLength(12)
-        strehl = [name for name in ANALYSES if "strehl" in name.lower()]
-        if strehl:
-            self.pz_analysis.setCurrentText(strehl[0])
+        self.pz_analysis.setToolTip("\n".join(PSF_POSITION_ANALYSES) or self.PZ_NO_ANALYSIS)
         self.pz_run = QtWidgets.QCheckBox("Analyse when finished")
-        self.pz_run.setChecked(bool(strehl))
-        if not strehl:
-            self.pz_run.setToolTip("No Strehl analysis registered: start the viewer with Objective-testing's "
-                                   "scripts/live_view.py, or analyse later with scripts/analyze_strehl_map.py")
+        self.pz_run.setChecked(bool(PSF_POSITION_ANALYSES))
+        self.pz_run.setEnabled(bool(PSF_POSITION_ANALYSES))
         pz_form = QtWidgets.QFormLayout()
         pz_form.addRow("Name", self.pz_name)
-        pz_form.addRow("Unit", self.pz_unit)
-        pz_form.addRow("Target z", self.pz_target)
-        pz_form.addRow("Camera z", self.pz_camera)
-        pz_form.addRow("Region centre x", self.pz_rx)
-        pz_form.addRow("Region centre y", self.pz_ry)
-        pz_form.addRow("Region side", self.pz_rsize)
+        pz_form.addRow("Target z", pz_rows["target_z"])
+        pz_form.addRow("Camera z", pz_rows["camera_z"])
+        pz_form.addRow("Rail offset", pz_rows["rail_offset"])
         pz_form.addRow("Analysis", self.pz_analysis)
         pz_widget = QtWidgets.QWidget()
         pz_widget.setLayout(pz_form)
@@ -614,10 +757,12 @@ class LiveView(QtWidgets.QMainWindow):
         pz_saved.clicked.connect(lambda: self.pz_analyse_folder())
         self._pz_buttons(False)
         pz_help = QtWidgets.QLabel(
-            "Strehl ratio against target and camera position: set the analysis region on the PSF, start, then for "
+            "Strehl ratio against target and camera position: set the analysis region (Settings) on the PSF, "
+            "start, then for "
             "every shot type the target z and camera z and take a snapshot. Take a background with the PSF light "
             "blocked (one per exposure and gain used). Frames go to data/experiment_data/&lt;name&gt;_&lt;time&gt;/ "
-            "with scan.json; when finished, the Strehl ratio of every shot is mapped against the two positions.")
+            "with scan.json, and a PNG of each (colour bar, scale as on screen) to its PNG folder; when "
+            "finished, the Strehl ratio of every shot is mapped against the two positions.")
         pz_help.setWordWrap(True)
         pz_help.setStyleSheet("color: gray")
 
@@ -635,10 +780,12 @@ class LiveView(QtWidgets.QMainWindow):
         layout.addWidget(self._group("Focal plane scan", help_text, form_widget, self.scan_run, self.scan_status,
                                      self.scan_btn_start, self.scan_btn_take, self.scan_btn_retake,
                                      self.scan_btn_finish, self.scan_btn_cancel, analyse))
-        layout.addWidget(self._group("PSF vs target and camera position", pz_help, pz_widget, region_centre,
-                                     self.pz_show, self.pz_run, self.pz_status, self.pz_btn_start, self.pz_btn_take,
+        layout.addWidget(self._group("PSF vs target and camera position", pz_help, pz_widget,
+                                     self.pz_run, self.pz_status, self.pz_btn_start, self.pz_btn_take,
                                      self.pz_btn_drop, self.pz_btn_bg, self.pz_btn_finish, self.pz_btn_cancel,
                                      pz_saved))
+        self.power_panel = PowerScanPanel(self, self._power_meter)
+        layout.addWidget(self.power_panel)
         layout.addStretch(1)
         scroll = QtWidgets.QScrollArea()
         scroll.setWidget(panel)
@@ -654,10 +801,27 @@ class LiveView(QtWidgets.QMainWindow):
         self.addDockWidget(QtCore.Qt.DockWidgetArea.LeftDockWidgetArea, self.align_dock)
         self.tabifyDockWidget(self.dock, self.align_dock)   # tabs with the settings; drag it out for its own window
         self.dock.raise_()
+        # One label per dock: the tabs sit on top, and a tabbed dock hides its own title bar.
+        # GroupedDragging lets a tab be dragged out into a window of its own (Qt allows it only then).
+        self.setTabPosition(QtCore.Qt.DockWidgetArea.AllDockWidgetAreas, QtWidgets.QTabWidget.TabPosition.North)
+        self.setDockOptions(self.dockOptions() | QtWidgets.QMainWindow.DockOption.GroupedDragging)
+        for dock in (self.dock, self.align_dock):
+            for signal in (dock.topLevelChanged, dock.dockLocationChanged, dock.visibilityChanged):
+                signal.connect(self._dock_titles)   # a bound method: disconnected when the window is deleted
+        self._dock_titles()
         act = self.align_dock.toggleViewAction()
         act.setText("Alignment")
-        act.setToolTip("Show / hide the alignment helpers (drag the title bar out for a separate window)")
+        act.setToolTip("Show / hide the alignment helpers (drag its tab out for a separate window)")
         self.toolbar.insertAction(self.toolbar.actions()[-1], act)
+
+    def _dock_titles(self, *_):
+        """Hide the title bar of a dock while it shares tabs with another (the tab is its label)."""
+        for dock in (self.dock, self.align_dock):
+            tabbed = not dock.isFloating() and any(
+                other.toggleViewAction().isChecked() and not other.isFloating()
+                for other in self.tabifiedDockWidgets(dock))
+            if tabbed != (dock.titleBarWidget() is not None):
+                dock.setTitleBarWidget(QtWidgets.QWidget() if tabbed else None)
 
     # ---------- focal plane scan ----------
 
@@ -673,7 +837,7 @@ class LiveView(QtWidgets.QMainWindow):
     def _pos(self, mm: float) -> str:
         """A position in mm, with the value in the input unit when that is not mm: '+12.700 mm (+0.500 inch)'."""
         unit, to_mm = self.scan_unit.currentText(), self.scan_unit.currentData()
-        return f"{mm:+.3f} mm" + (f" ({mm / to_mm:+.3f} {unit})" if unit != "mm" else "")
+        return f"{format_position(mm)} mm" + (f" ({format_position(mm / to_mm)} {unit})" if unit != "mm" else "")
 
     @property
     def _scan_next(self) -> float:
@@ -766,54 +930,100 @@ class LiveView(QtWidgets.QMainWindow):
         if folder:
             self.scan_analyse(Path(folder))
 
-    def scan_analyse(self, folder: Path, name: str | None = None):
+    def scan_analyse(self, folder: Path, name: str | None = None, analyses: dict = ANALYSES):
+        """Run analysis `name` (default: the focal-plane scan's choice) from the registry `analyses`."""
         name = name or self.scan_analysis.currentText()
-        if name not in ANALYSES:
+        if name not in analyses:
             QtWidgets.QMessageBox.information(self, "Analysis", "No analysis selected.")
             return
         try:
-            fig = ANALYSES[name](folder)
+            figures = analyses[name](folder)
         except Exception as err:   # a bad scan must not take the viewer down
             QtWidgets.QMessageBox.critical(self, name, f"{type(err).__name__}: {err}")
             return
-        self.show_figure(fig, f"{name} — {Path(folder).name}")
+        for fig in figures if isinstance(figures, (list, tuple)) else [figures]:   # one figure or several
+            self.show_figure(fig, f"{name} — {Path(folder).name}")
 
     # ---------- PSF vs target and camera position ----------
 
     PZ_AXES = ("target_z", "camera_z")
+    PZ_NO_ANALYSIS = ("No analysis registered for this experiment: start the viewer with Objective-testing's "
+                      "scripts/live_view.py, or analyse later with its scripts/analyze_psf_scan.py.")
 
-    def _pz_region(self) -> dict:
-        return dict(centre=[self.pz_rx.value(), self.pz_ry.value()], size=self.pz_rsize.value())
+    @staticmethod
+    def _png_path(npy_path: Path) -> Path:
+        """PNG/<same name>.png in the experiment folder, for a frame saved as <name>.npy."""
+        return npy_path.parent / "PNG" / f"{npy_path.stem}.png"
 
-    def _show_psf_region(self):
+    def _settings_text(self) -> str:
+        return f"{self.cam.exposure_us:.0f} µs, {self.cam.gain_db:g} dB"
+
+    def _save_png(self, npy_path: Path, frame: np.ndarray, title: str):
+        """Draw the raw frame with its colour bar, in the colour scale on screen (log or linear), as
+        PNG/<same name>.png, in a worker thread so the live image does not stall (~0.7 s per PNG)."""
+        from allied_vision.camera_plot_helpers import save_psf_2d
+        png = self._png_path(npy_path)
+        png.parent.mkdir(exist_ok=True)
+        job = self._png_pool.submit(save_psf_2d, frame.copy(), png, title=f"{npy_path.name}\n{title}",
+                                    max_value=self.cam.max_value, log=self.log_scale.isChecked())
+        job.add_done_callback(lambda j: j.exception() and print(f"[live view] {png.name} not saved: {j.exception()}"))
+        self._png_jobs = [j for j in self._png_jobs if not j.done()] + [job]
+
+    def _region(self) -> dict:
+        return dict(centre=[self.region_x.value(), self.region_y.value()], size=self.region_size.value())
+
+    def _show_region(self):
         """Draw the analysis region (a square centred on the region centre; pixel i spans [i, i + 1))."""
         if not hasattr(self, "plot"):
             return
-        r = self._pz_region()
+        r = self._region()
         pos = (r["centre"][0] + 0.5 - r["size"] / 2, r["centre"][1] + 0.5 - r["size"] / 2)
-        if self.pz_roi is None:
-            self.pz_roi = pg.ROI(pos, (r["size"], r["size"]), movable=True, rotatable=False, resizable=False,
-                                 pen=pg.mkPen("#ff8c00", width=2, style=QtCore.Qt.PenStyle.DashLine))
-            self.pz_roi.setZValue(10)
-            self.plot.addItem(self.pz_roi)
-            self.pz_roi.sigRegionChangeFinished.connect(self._pz_region_dragged)
-        self.pz_roi.blockSignals(True)
-        self.pz_roi.setPos(pos, update=False)
-        self.pz_roi.setSize((r["size"], r["size"]), update=False)
-        self.pz_roi.stateChanged(finish=False)
-        self.pz_roi.blockSignals(False)
-        self.pz_roi.setVisible(self.pz_show.isChecked())
+        if self.region_roi is None:
+            self.region_roi = _OutlineROI(pos, (r["size"], r["size"]), movable=True, rotatable=False, resizable=False,
+                                          pen=pg.mkPen("#ff8c00", width=2, style=QtCore.Qt.PenStyle.DashLine))
+            self.region_roi.setZValue(10)
+            self.plot.addItem(self.region_roi)
+            self.region_roi.sigRegionChangeFinished.connect(self._region_dragged)
+            # highest count in the region, centred above the square (y points down on the image); large,
+            # white with a black outline so that it stands out on every colour of the scale
+            self.region_label = OutlinedText(anchor=(0.5, 1.0), size_pt=16)
+            self.region_label.setZValue(10)
+            self.plot.addItem(self.region_label)
+        self.region_roi.blockSignals(True)
+        self.region_roi.setPos(pos, update=False)
+        self.region_roi.setSize((r["size"], r["size"]), update=False)
+        self.region_roi.stateChanged(finish=False)
+        self.region_roi.blockSignals(False)
+        self.region_label.setPos(r["centre"][0] + 0.5, pos[1])
+        for item in (self.region_roi, self.region_label):
+            item.setVisible(self.region_show.isChecked())
+        self._show_region_peak()
 
-    def _pz_region_dragged(self):
+    def _show_region_peak(self):
+        """Write the highest count of the newest frame inside the analysis region above the square: raw, or
+        with the background subtracted when that box is ticked and a background covers the readout."""
+        if self.region_roi is None or not self.region_show.isChecked() or self._raw_last is None:
+            return
+        raw = self._region_peak(self._raw_last)
+        saturated = raw >= self.cam.max_value
+        if self.region_bg.isChecked() and self._background_fits(self._raw_last):
+            text = f"max {self._region_peak(self._raw_last, subtract=True):.0f} (bg subtracted)"
+        else:
+            text = f"max {raw:.0f}"
+        # magenta when the raw frame saturates: a colour the beam-profiler scale does not have
+        self.region_label.set_outlined(text + ("  SATURATED" if saturated else ""),
+                                       fill="#ff40ff" if saturated else "white")
+
+    def _region_dragged(self):
         """The square was dragged on the image: follow it with the centre fields."""
-        pos, size = self.pz_roi.pos(), self.pz_rsize.value()
-        for spin, v in ((self.pz_rx, pos.x() + size / 2 - 0.5), (self.pz_ry, pos.y() + size / 2 - 0.5)):
+        pos, size = self.region_roi.pos(), self.region_size.value()
+        for spin, v in ((self.region_x, pos.x() + size / 2 - 0.5), (self.region_y, pos.y() + size / 2 - 0.5)):
             spin.blockSignals(True)
             spin.setValue(int(round(v)))
             spin.blockSignals(False)
-        self._show_psf_region()
+        self._show_region()
 
-    def pz_centre_on_fit(self):
+    def region_centre_on_fit(self):
         if self._fit is not None and "error" not in self._fit:
             x, y = self._fit["x0"], self._fit["y0"]
         elif self._raw_last is not None:
@@ -822,50 +1032,69 @@ class LiveView(QtWidgets.QMainWindow):
         else:
             QtWidgets.QMessageBox.information(self, "Analysis region", "No frame yet: start the live stream.")
             return
-        self.pz_rx.setValue(int(round(x)))
-        self.pz_ry.setValue(int(round(y)))
+        self.region_x.setValue(int(round(x)))
+        self.region_y.setValue(int(round(y)))
 
     def _pz_buttons(self, running: bool):
         self.pz_btn_start.setEnabled(not running)
-        for w in (self.pz_name, self.pz_unit):
+        for w in (self.pz_name, *self.pz_units.values(), self.pz_pos["rail_offset"]):   # fixed for an experiment
             w.setEnabled(not running)
         for b in (self.pz_btn_take, self.pz_btn_bg, self.pz_btn_finish, self.pz_btn_cancel):
             b.setEnabled(running)
         self.pz_btn_drop.setEnabled(running and self._pz is not None and len(self._pz) > 0)
 
     def _pz_positions(self) -> dict:
-        to_mm = self.pz_unit.currentData()
-        return {"target_z": self.pz_target.value() * to_mm, "camera_z": self.pz_camera.value() * to_mm}
+        """Typed positions in mm, each axis in its own input unit."""
+        return {axis: self.pz_pos[axis].value() * self.pz_units[axis].currentData() for axis in self.PZ_AXES}
 
     def _pz_where(self, positions: dict) -> str:
-        unit, to_mm = self.pz_unit.currentText(), self.pz_unit.currentData()
-        def one(mm):
-            return f"{mm:+.3f} mm" + (f" ({mm / to_mm:+.3f} {unit})" if unit != "mm" else "")
-        return f"target {one(positions['target_z'])}, camera {one(positions['camera_z'])}"
+        def one(axis):
+            mm, unit, to_mm = positions[axis], self.pz_units[axis].currentText(), self.pz_units[axis].currentData()
+            return f"{format_position(mm)} mm" + (f" ({format_position(mm / to_mm)} {unit})" if unit != "mm" else "")
+        return f"target {one('target_z')}, camera {one('camera_z')}"
 
     def _pz_say(self, text: str):
         if self._pz is not None:
             self.pz_btn_take.setText(f"Take snapshot at {self._pz_where(self._pz_positions())}")
         self.pz_status.setText(text)
 
-    def _region_peak(self, frame: np.ndarray) -> float:
-        """Highest raw count inside the analysis region (0 if the region misses the readout)."""
-        r, a = self._pz_region(), self._aoi
+    def _region_box(self, shape: tuple[int, int]) -> tuple[int, int, int, int] | None:
+        """(x_min, y_min, x_max, y_max) of the analysis region in frame pixels (inclusive, clipped to the
+        readout of `shape`), None if the region misses the readout."""
+        r, a = self._region(), self._aoi
         half = r["size"] // 2
         x0, y0 = max(r["centre"][0] - half - a["offset_x"], 0), max(r["centre"][1] - half - a["offset_y"], 0)
-        x1, y1 = r["centre"][0] + half - a["offset_x"] + 1, r["centre"][1] + half - a["offset_y"] + 1
-        part = frame[y0:max(y1, y0), x0:max(x1, x0)]
-        return float(part.max()) if part.size else 0.0
+        x1 = min(r["centre"][0] + half - a["offset_x"], shape[1] - 1)
+        y1 = min(r["centre"][1] + half - a["offset_y"], shape[0] - 1)
+        return (x0, y0, x1, y1) if x1 >= x0 and y1 >= y0 else None
+
+    def _background_fits(self, frame: np.ndarray) -> bool:
+        """A background is loaded and covers the readout of `frame`."""
+        return self._bg_slice is not None and self._bg_slice.shape == frame.shape
+
+    def _region_peak(self, frame: np.ndarray, subtract: bool = False) -> float:
+        """Highest count inside the analysis region (0 if the region misses the readout), of the raw frame or,
+        with subtract, of the frame minus the background (negative differences count as 0, as on screen)."""
+        box = self._region_box(frame.shape)
+        if box is None:
+            return 0.0
+        x0, y0, x1, y1 = box
+        part = frame[y0:y1 + 1, x0:x1 + 1]
+        if subtract:
+            part = part.astype(np.int32) - self._bg_slice[y0:y1 + 1, x0:x1 + 1]
+        return max(float(part.max()), 0.0)
 
     def pz_begin(self):
         try:
             self._pz = PositionScan.start(self.data_root, self.pz_name.text(), unit="mm", camera=self.cam,
                                           subfolder="experiment_data", axes=self.PZ_AXES,
-                                          input_unit=self.pz_unit.currentText(), analysis_region=self._pz_region())
+                                          input_units={a: u.currentText() for a, u in self.pz_units.items()},
+                                          rail_offset=self.pz_pos["rail_offset"].value()
+                                          * self.pz_units["rail_offset"].currentData(),
+                                          analysis_region=self._region())
         except OSError as err:
             QtWidgets.QMessageBox.critical(self, "Experiment", str(err))
             return
-        self.pz_show.setChecked(True)
         self._pz_buttons(True)
         self._pz_say(f"Experiment folder: {self._pz.folder.name}<br>Type the target and camera positions and take "
                      f"the first snapshot. Keep the PSF inside the orange square.")
@@ -878,7 +1107,8 @@ class LiveView(QtWidgets.QMainWindow):
             return
         frame, positions = self._raw_last, self._pz_positions()
         path = self._pz.add(positions, frame, exposure_us=self.cam.exposure_us, gain_db=self.cam.gain_db,
-                            aoi=dict(self._aoi), analysis_region=self._pz_region())
+                            aoi=dict(self._aoi), analysis_region=self._region())
+        self._save_png(path, frame, f"{self._pz_where(positions)}\n{self._settings_text()}")
         peak = self._region_peak(frame)
         warn = ""
         if peak >= 0.99 * self.cam.max_value:
@@ -894,7 +1124,10 @@ class LiveView(QtWidgets.QMainWindow):
     def pz_drop_last(self):
         if self._pz is None:
             return
+        wait(self._png_jobs)        # its PNG may still be drawing
         entry = self._pz.drop_last()
+        if entry:
+            self._png_path(self._pz.folder / entry["file"]).unlink(missing_ok=True)
         self._pz_buttons(True)
         self._pz_say(f"Dropped {entry['file'] if entry else 'nothing'}.")
 
@@ -905,6 +1138,7 @@ class LiveView(QtWidgets.QMainWindow):
         frame = self._raw_last
         path = self._pz.add_background(frame, exposure_us=self.cam.exposure_us, gain_db=self.cam.gain_db,
                                        aoi=dict(self._aoi))
+        self._save_png(path, frame, f"background (PSF light blocked)\n{self._settings_text()}")
         peak = self._region_peak(frame)
         snaps = [e for e in self._pz.meta["snapshots"] if e.get("peak")]
         warn = ""
@@ -948,7 +1182,7 @@ class LiveView(QtWidgets.QMainWindow):
         self.pz_btn_take.setText("Take snapshot")
         self.pz_status.setText(f"Finished: {len(scan)} snapshots, {len(scan.backgrounds)} background(s) in {folder}")
         if self.pz_run.isChecked() and len(scan):
-            self.scan_analyse(folder, self.pz_analysis.currentText())
+            self.scan_analyse(folder, self.pz_analysis.currentText(), PSF_POSITION_ANALYSES)
 
     def pz_cancel(self):
         if self._pz is None:
@@ -959,10 +1193,13 @@ class LiveView(QtWidgets.QMainWindow):
         self.pz_status.setText(f"Cancelled; the {len(scan)} snapshots stay in {scan.folder.name}.")
 
     def pz_analyse_folder(self):
+        if not PSF_POSITION_ANALYSES:
+            QtWidgets.QMessageBox.information(self, "Analysis", self.PZ_NO_ANALYSIS)
+            return
         start = latest_scan(self.data_root, "experiment_data") or (self.data_root / "experiment_data")
         folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Experiment folder (contains scan.json)", str(start))
         if folder:
-            self.scan_analyse(Path(folder), self.pz_analysis.currentText())
+            self.scan_analyse(Path(folder), self.pz_analysis.currentText(), PSF_POSITION_ANALYSES)
 
     def show_figure(self, fig, title: str):
         """A matplotlib figure in its own (non-blocking) window with the usual toolbar."""
@@ -985,18 +1222,24 @@ class LiveView(QtWidgets.QMainWindow):
         column.setContentsMargins(0, 0, 0, 0)
         column.setSpacing(2)
         column.addWidget(self.view, 1)
-        # Rows under the plot: pixel under the mouse and its value; the Gaussian fit.
-        # Plain labels that wrap, so a long readout never makes the window wider than the screen.
-        self.readout, self.fit_readout = QtWidgets.QLabel(""), QtWidgets.QLabel("")
-        for label, size in ((self.readout, 10), (self.fit_readout, 12)):
-            label.setWordWrap(True)
+        # Rows under the plot: pixel under the mouse and its value; the Gaussian fit numbers (large); its notes,
+        # warnings and average. Each row is one line of fixed height, so fits that come and go never resize the
+        # image; a line too long for the window is cut at the right (the notes row shows it whole as a tooltip).
+        self.readout, self.fit_values, self.fit_notes = QtWidgets.QLabel(), QtWidgets.QLabel(), QtWidgets.QLabel()
+        for label, sample in ((self.readout, "pixel x = 0"), (self.fit_values, self._fit_values_text()),
+                              (self.fit_notes, "fitted peak 0 counts")):
             label.setTextFormat(QtCore.Qt.TextFormat.RichText)
             label.setContentsMargins(8, 0, 8, 2)
-            label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Minimum)
+            label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Fixed)
             font = label.font()
-            font.setPointSize(size)
+            font.setPointSize(10)
             label.setFont(font)
+            label.setText(sample)
+            label.setFixedHeight(label.sizeHint().height())
+            label.setText("")
             column.addWidget(label)
+        self.fit_values.setVisible(self.fit_on.isChecked())   # the fit rows only while the fit is on
+        self.fit_notes.setVisible(self.fit_on.isChecked())
         self.setCentralWidget(centre)
         self.plot = self.view.addPlot(viewBox=_PanViewBox())
         self.plot.setAspectLocked(True)
@@ -1011,8 +1254,8 @@ class LiveView(QtWidgets.QMainWindow):
                                    interactive=False, label="counts")
         self.bar.setImageItem(self.img_item, insert_in=self.plot)
 
-        self.roi = pg.RectROI([0, 0], [W, H], pen=pg.mkPen("y", width=2), sideScalers=True,
-                              maxBounds=QtCore.QRectF(0, 0, W, H))
+        self.roi = _OutlineRectROI([0, 0], [W, H], pen=pg.mkPen("y", width=2), sideScalers=True,
+                                   maxBounds=QtCore.QRectF(0, 0, W, H))
         self.roi.setZValue(10)
         self.plot.addItem(self.roi)
         self.roi.sigRegionChanged.connect(self._roi_moved)
@@ -1056,6 +1299,7 @@ class LiveView(QtWidgets.QMainWindow):
     def set_live(self, on: bool):
         if on:
             self._camera_call(self.cam.start_live)
+            self._t_frame = time.perf_counter()
             self.timer.start()
         else:
             self.timer.stop()
@@ -1222,7 +1466,9 @@ class LiveView(QtWidgets.QMainWindow):
     def _poll(self):
         frame = self.cam.grab_latest()
         if frame is None:
+            self._check_stalled()
             return
+        self._t_frame = time.perf_counter()
         self._raw_last = frame
         if self._dead_accum is not None:
             self._accumulate_dead(frame)
@@ -1235,10 +1481,41 @@ class LiveView(QtWidgets.QMainWindow):
         self._last = frame
         self._frames += 1
         self._update_readout()  # the value under a resting mouse follows the live frame
+        self._show_region_peak()
         self._update_fit(frame)
         now = time.perf_counter()
         if now - self._t_status >= self.STATUS_S:
             self._update_status(now)
+
+    # ---------- lost camera link ----------
+
+    def _check_stalled(self):
+        """Live, but no frame for STALL_S (+ 3 exposures): reconnect a camera that can (GigE cameras
+        drop the host while Windows Modern Standby suspends this process, e.g. with the screen locked)."""
+        now = time.perf_counter()
+        if not hasattr(self.cam, "reconnect") or now < self._next_reconnect:
+            return
+        if now - self._t_frame < self.STALL_S + 3e-6 * self.exposure.value():   # widget: the camera may be gone
+            return
+        self.status.setText("No frames: camera connection lost (screen lock / standby?), reconnecting…")
+        self.status.setStyleSheet("color: red; font-weight: bold")
+        QtWidgets.QApplication.processEvents()
+        a = dict(self._aoi)
+        try:
+            self.cam.reconnect()
+            self.cam.set_exposure(self.exposure.value())   # restore what was set in the viewer
+            self.cam.set_gain(self.gain.value())
+            self.cam.set_aoi(offset_px=(a["offset_x"], a["offset_y"]), width_px=a["width"], height_px=a["height"])
+            self.cam.start_live()
+        except Exception as err:
+            self._next_reconnect = time.perf_counter() + self.RECONNECT_S
+            self.status.setText(f"Camera not back yet, retrying every {self.RECONNECT_S:.0f} s "
+                                f"({type(err).__name__}: {str(err).splitlines()[0]})")
+            return
+        self._t_frame = time.perf_counter()
+        self._aoi = self.cam.aoi
+        self.statusBar().showMessage("Camera reconnected after the link was lost; exposure, gain and readout "
+                                     "region restored.", 15000)
 
     # ---------- Gaussian fit ----------
 
@@ -1249,45 +1526,89 @@ class LiveView(QtWidgets.QMainWindow):
             return
         if self.dead_ignore.isChecked() and self._dead is not None:
             frame = repair(frame, self._dead, offset=(self._aoi["offset_y"], self._aoi["offset_x"]))
+        search = None
+        if self.fit_in_region.isChecked():          # the spot is looked for in the orange square only
+            search = self._region_box(frame.shape)
         try:
-            fit = fit_gaussian_2d(frame, self._fit_half)
+            if self.fit_in_region.isChecked() and search is None:
+                raise RuntimeError("the analysis region (orange square) is outside the readout")
+            fit = fit_gaussian_2d(frame, self._fit_half, search=search)
         except RuntimeError as err:
             self._fit = dict(error=str(err))
+            if self._cuts is not None and self._cuts.isVisible():
+                self._cuts.show_cuts(None, None)
         else:
+            if self._cuts is not None and self._cuts.isVisible():   # still in the array coordinates of the frame
+                self._cuts.show_cuts(frame, fit, (self._aoi["offset_x"], self._aoi["offset_y"]))
             fit["x0"] += self._aoi["offset_x"]   # array coordinates of the frame -> sensor pixels
             fit["y0"] += self._aoi["offset_y"]
             fit["ms"] = 1e3 * (time.perf_counter() - now)
             self._fit = fit
             self._fit_history.append((fit["x0"], fit["y0"]))   # log of the fitted centres (sensor pixels)
+            self.power_panel.on_fit(fit)                       # a point of a running power-meter scan
         self._fit_time = time.perf_counter()   # interval counted from the end of the fit
         self._show_fit()
 
+    def open_cuts(self):
+        """Show the x / y cut window (a separate window, to put next to this one); switches the fit on."""
+        if self._cuts is None:
+            self._cuts = FitCutsWindow(self.cam.max_value, self, self._cut_optics())
+            self._cuts.opticsChanged.connect(self._save_cut_optics)
+        self.fit_on.setChecked(True)
+        self._cuts.show()
+        self._cuts.raise_()
+
+    def _cut_optics(self) -> dict:
+        """Imaging system of the cut window: the camera's pixel size and the launcher's optics, overridden
+        by what was set in the window's Imaging system… dialog for this camera."""
+        try:
+            saved = json.loads(QtCore.QSettings(*self._settings).value(f"optics/{self._camera_key}", "{}") or "{}")
+        except (ValueError, TypeError):
+            saved = {}
+        base = {"pixel_size_um": getattr(self.cam, "pixel_size_um", None), **self.optics}
+        return {key: saved.get(key, base.get(key)) for key in OPTICS_FIELDS}
+
+    def _save_cut_optics(self, optics: dict):
+        QtCore.QSettings(*self._settings).setValue(
+            f"optics/{self._camera_key}", json.dumps({key: optics.get(key) for key in OPTICS_FIELDS}))
+
+    @staticmethod
+    def _fit_values_text(x="—", y="—", w_major="—", w_minor="—", ellipticity="—", angle="—", unit="px") -> str:
+        """Large-number row of the fit readout; the defaults are the placeholders shown while no fit succeeds."""
+        big = "<span style='font-size: 15pt; font-weight: bold'>{}</span>".format
+        gap = "&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;"
+        return (f"centre x = {big(x)}, y = {big(y)} {unit}{gap}1/e² radii {big(w_major)} × {big(w_minor)} {unit}"
+                f"{gap}ellipticity {big(ellipticity)}{gap}major axis {big(angle)}°")
+
     def _show_fit(self):
-        """Readout row and ellipse for the last fit, in the chosen units and origin."""
-        fit = self._fit if self.fit_on.isChecked() else None
+        """Readout rows and ellipse for the last fit, in the chosen units and origin."""
+        on = self.fit_on.isChecked()
+        self.fit_values.setVisible(on)
+        self.fit_notes.setVisible(on)
+        fit = self._fit if on else None
+        scale, unit = self.fit_units.currentData(), "px" if self.fit_units.currentIndex() == 0 else "µm"
         if fit is None or "error" in fit:
-            self.fit_readout.setText("" if fit is None else f"Gaussian fit: {fit['error']}")
+            self.fit_values.setText(self._fit_values_text(unit=unit))
+            notes = [] if fit is None else [f"<span style='color: #c00000'>no fit: {fit['error']}</span>"]
+            self._set_fit_notes(notes + self._average_text(scale, unit))
             self.fit_curve.setData([], [])
             return
-        scale, unit = self.fit_units.currentData(), "px" if self.fit_units.currentIndex() == 0 else "µm"
         x, y = self._in_fit_frame(fit["x0"], fit["y0"])
         # ellipticity as in ISO 11146: minor / major radius (1 = round); angle of the major axis from +x
         w_major, w_minor = max(fit["wx"], fit["wy"]), min(fit["wx"], fit["wy"])
         major_deg = np.degrees(fit["theta"]) + (90 if fit["wy"] > fit["wx"] else 0)
         major_deg = (major_deg + 90) % 180 - 90
-        self.fit_readout.setText(
-            f"<b>Gaussian centre</b>  x = <b>{x * scale:.2f}</b>, y = <b>{y * scale:.2f}</b> {unit}"
-            f"&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;1/e² radii {w_major * scale:.2f} × {w_minor * scale:.2f} {unit}, "
-            f"<b>ellipticity {w_minor / w_major:.3f}</b>, major axis at {major_deg:.0f}°"
-            f"&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;fitted peak {fit['peak']:.0f} counts"
-            f"&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;{fit['ms']:.0f} ms"
-            + (f" (binned {fit['binning']}×)" if fit["binning"] > 1 else "")
-            + ("<br><span style='color: #c00000'>centre outside the readout: extrapolated from the visible part "
-               "of the beam</span>" if fit.get("outside") else "")
-            + ("<br><span style='color: #c00000'>beam wider than the fit window: the radii are not measured, "
-               "choose a larger window or full frame</span>"
-               if self._fit_half is not None and w_major > self._fit_half else "")
-            + self._average_text(scale, unit))
+        self.fit_values.setText(self._fit_values_text(
+            f"{x * scale:.2f}", f"{y * scale:.2f}", f"{w_major * scale:.2f}", f"{w_minor * scale:.2f}",
+            f"{w_minor / w_major:.3f}", f"{major_deg:.0f}", unit))
+        red = "<span style='color: #c00000'>{}</span>".format
+        notes = [red("centre outside the readout: extrapolated from the visible part of the beam")
+                 ] if fit.get("outside") else []
+        if self._fit_half is not None and w_major > self._fit_half:
+            notes.append(red("beam wider than the fit window: radii not measured, choose a larger window or full frame"))
+        notes.append(f"fitted peak {fit['peak']:.0f} counts, {fit['ms']:.0f} ms"
+                     + (f" (binned {fit['binning']}×)" if fit["binning"] > 1 else ""))
+        self._set_fit_notes(notes + self._average_text(scale, unit))
         if not self.fit_ellipse.isChecked():
             self.fit_curve.setData([], [])
             return
@@ -1310,13 +1631,20 @@ class LiveView(QtWidgets.QMainWindow):
         mean, sd = h.mean(axis=0), h.std(axis=0, ddof=1)
         return dict(n=len(h), x0=float(mean[0]), y0=float(mean[1]), x_sd=float(sd[0]), y_sd=float(sd[1]))
 
-    def _average_text(self, scale: float, unit: str) -> str:
+    def _average_text(self, scale: float, unit: str) -> list[str]:
+        """The average-centre note of the fit readout (empty list before 2 fits)."""
         avg = self._fit_average()
         if avg is None:
-            return ""
+            return []
         x, y = self._in_fit_frame(avg["x0"], avg["y0"])
-        return (f"<br>Average centre of the last {avg['n']} fits: x = <b>{x * scale:.2f}</b> ± {avg['x_sd'] * scale:.2f}, "
-                f"y = <b>{y * scale:.2f}</b> ± {avg['y_sd'] * scale:.2f} {unit} (± = standard deviation)")
+        return [f"average centre of the last {avg['n']} fits: x = <b>{x * scale:.2f}</b> ± {avg['x_sd'] * scale:.2f}, "
+                f"y = <b>{y * scale:.2f}</b> ± {avg['y_sd'] * scale:.2f} {unit} (± = standard deviation)"]
+
+    def _set_fit_notes(self, notes: list[str]):
+        """Second fit row: the notes on one line; the whole line as tooltip, in case the window cuts it."""
+        text = "&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;".join(notes)
+        self.fit_notes.setText(text)
+        self.fit_notes.setToolTip(text)
 
     def _fit_window_changed(self, text: str):
         """Parse the fit-window box: 'full frame', or a half-size in px ('±50 px', '50')."""
@@ -1398,6 +1726,10 @@ class LiveView(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.information(self, "Reference point", "No Gaussian fit yet: switch the fit on.")
                 return
             x0, y0, note = self._fit["x0"], self._fit["y0"], ""
+        self.add_reference_point(name, x0, y0, note)
+
+    def add_reference_point(self, name: str, x0: float, y0: float, note: str = ""):
+        """Save the point (sensor pixels) under `name`, moving an existing point of that name, and show it."""
         point = dict(name=name, x=float(x0), y=float(y0), note=note)
         names = [r["name"] for r in self._refs]
         if name in names:
@@ -1551,15 +1883,18 @@ class LiveView(QtWidgets.QMainWindow):
         self.cam.data_root = self.data_root
         try:
             img, out_dir = self.cam.snapshot(experiment, comment=comment, save_preview=True)
+            self._t_frame = time.perf_counter()   # the stream was paused, not lost
         except Exception as err:
             QtWidgets.QMessageBox.critical(self, "Snapshot failed", str(err))
             return
-        # The data file is always the raw frame; note which background was in use
+        # The data file is always the raw frame; note which background was in use, and the analysis
+        # region (centre and side in sensor pixels, top-left pixel (0, 0)) for the analyses' peak search
         for meta_path in Path(out_dir).glob("metadata_*.json"):
             meta = json.loads(meta_path.read_text())
             meta["background"] = None if self._background is None else dict(
                 file=str(self._background_path), applied_to_data=False,
                 shown_subtracted=self.subtract.isChecked())
+            meta["analysis_region"] = self._region()
             meta_path.write_text(json.dumps(meta, indent=4))
         peak = int(img.max())
         warning = "   —   SATURATED, lower the exposure" if peak >= 0.99 * self.cam.max_value else ""
@@ -1576,14 +1911,19 @@ class LiveView(QtWidgets.QMainWindow):
         if geometry is not None and self.restoreGeometry(geometry):
             if state is not None:
                 self.restoreState(state)
+                self._dock_titles()
             self.show()
         else:
             self.showMaximized()   # fills the screen minus the taskbar, so nothing is hidden behind it
 
     def reset_layout(self):
-        self.dock.setFloating(False)
-        self.addDockWidget(QtCore.Qt.DockWidgetArea.LeftDockWidgetArea, self.dock)
-        self.dock.show()
+        for dock in (self.dock, self.align_dock):
+            dock.setFloating(False)
+            self.addDockWidget(QtCore.Qt.DockWidgetArea.LeftDockWidgetArea, dock)
+            dock.show()
+        self.tabifyDockWidget(self.dock, self.align_dock)
+        self.dock.raise_()
+        self._dock_titles()
         self.resizeDocks([self.dock], [self.PANEL_MIN_WIDTH], QtCore.Qt.Orientation.Horizontal)
         self.showNormal()
         self.showMaximized()
@@ -1593,14 +1933,27 @@ class LiveView(QtWidgets.QMainWindow):
         store.setValue("geometry", self.saveGeometry())
         store.setValue("state", self.saveState())
         store.setValue("fit_window", self.fit_window.currentText())
+        for key, spin in (("region_x", self.region_x), ("region_y", self.region_y), ("region_size", self.region_size)):
+            store.setValue(key, spin.value())
+        store.setValue("region_show", self.region_show.isChecked())
+        store.setValue("region_bg", self.region_bg.isChecked())
+        store.setValue("fit_in_region", self.fit_in_region.isChecked())
+        self.power_panel.shutdown()          # releases the power meter
         self.set_live(False)
+        self._png_pool.shutdown(wait=True)   # finish the PNGs still being drawn
         super().closeEvent(event)
 
 
-def run_live_view(cam, data_root: str | Path, experiment: str = "live view") -> int:
-    """Open the viewer on `cam` and block until the window is closed."""
+def run_live_view(cam, data_root: str | Path, experiment: str = "live view", optics: dict | None = None,
+                  power_meter=None) -> int:
+    """
+    Open the viewer on `cam` and block until the window is closed. optics
+    (wavelength_nm, na, magnification) sets the first Airy zero in the cut window.
+    power_meter: an open meter for the power-meter scan (power_scan.py interface;
+    closed by the viewer), or None to connect one from the Alignment dock.
+    """
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    window = LiveView(cam, data_root, experiment)
+    window = LiveView(cam, data_root, experiment, optics, power_meter)
     window.show_remembered()
     try:
         return app.exec()
